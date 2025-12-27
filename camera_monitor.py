@@ -23,7 +23,8 @@ MESSAGE_FILE = os.path.join(BASE_DIR, "templates", "camera_only_down.txt")
 # Logging (file + stdout for journalctl)
 # ----------------------------
 logger = logging.getLogger("camera_monitor")
-logger.setLevel(logging.WARNING)
+# logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
