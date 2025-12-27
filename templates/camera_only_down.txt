@@ -1,0 +1,9 @@
+Camera alert for station {station}
+
+No messages have been received since:
+{time}
+
+This indicates the camera may be offline.
+
+If you no longer wish to receive these alerts, unsubscribe here:
+{unsubscribe_link}
