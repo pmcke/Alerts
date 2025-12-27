@@ -6,6 +6,10 @@ import logging
 import configparser
 import os
 import sys
+import hmac
+import hashlib
+import urllib.parse
+import html as htmlmod
 from datetime import datetime, timedelta, timezone
 
 import paho.mqtt.client as mqtt
@@ -17,14 +21,17 @@ from mailjet_rest import Client
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "stations.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
-MESSAGE_FILE = os.path.join(BASE_DIR, "templates", "camera_only_down.txt")
+
+# Template location:
+# Prefer /home/pmcke/Alerts/templates/camera_only_down.txt but fallback to /home/pmcke/Alerts/camera_only_down.txt
+MESSAGE_FILE_PRIMARY = os.path.join(BASE_DIR, "templates", "camera_only_down.txt")
+MESSAGE_FILE_FALLBACK = os.path.join(BASE_DIR, "camera_only_down.txt")
 
 # ----------------------------
 # Logging (file + stdout for journalctl)
 # ----------------------------
 logger = logging.getLogger("camera_monitor")
-# logger.setLevel(logging.DEBUG)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.WARNING)
 
 log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
 
@@ -62,7 +69,10 @@ MAILJET_API_KEY = config.get("mailjet", "api_key", fallback="")
 MAILJET_SECRET = config.get("mailjet", "api_secret", fallback="")
 FROM_EMAIL = config.get("mailjet", "from_email", fallback="")
 FROM_NAME = config.get("mailjet", "from_name", fallback="Meteor Camera Alerts")
-UNSUB_BASE_URL = config.get("mailjet", "unsubscribe_url", fallback="")
+UNSUB_BASE_URL = config.get("mailjet", "unsubscribe_url", fallback="").strip()
+
+# Unsubscribe signing secret (must match what unsubscribe.py expects)
+UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "").strip()
 
 # Basic config sanity checks (don’t print secrets)
 if not MQTT_HOST:
@@ -74,6 +84,10 @@ if not MAILJET_API_KEY or not MAILJET_SECRET:
     logger.warning("Missing Mailjet credentials (emails will fail)")
 if not FROM_EMAIL:
     logger.warning("Missing Mailjet from_email (emails will fail)")
+if not UNSUB_BASE_URL:
+    logger.warning("Missing mailjet.unsubscribe_url in config.ini (unsubscribe links will be omitted)")
+if not UNSUBSCRIBE_SECRET:
+    logger.warning("UNSUBSCRIBE_SECRET env var not set (signed unsubscribe links will be omitted)")
 
 # ----------------------------
 # Mailjet setup
@@ -83,7 +97,7 @@ mailjet = Client(auth=(MAILJET_API_KEY, MAILJET_SECRET), version="v3.1")
 # ----------------------------
 # State
 # ----------------------------
-last_seen = {}        # station -> datetime (UTC)   (still useful for "is it alive" info)
+last_seen = {}        # station -> datetime (UTC)  (still useful for debug/health)
 camera_status = {}    # station -> "0" or "1"
 offline_since = {}    # station -> datetime of FIRST seen camerastatus=0
 alert_sent = set()    # stations already alerted for current offline period
@@ -110,6 +124,57 @@ def get_recipient(station: str):
 
 
 # ----------------------------
+# Unsubscribe link helpers (signed)
+# ----------------------------
+def _hmac_sig(station_upper: str, email: str) -> str:
+    msg = f"{station_upper}|{email}".encode("utf-8")
+    return hmac.new(UNSUBSCRIBE_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+
+
+def build_unsubscribe_link(base_url: str, station_upper: str, email: str) -> str:
+    """
+    Build a signed unsubscribe URL:
+      <base_url>?station=STATION&email=EMAIL&sig=HMAC
+    Returns "" if base_url or secret missing.
+    """
+    if not base_url or not UNSUBSCRIBE_SECRET:
+        return ""
+
+    sig = _hmac_sig(station_upper, email)
+
+    parsed = urllib.parse.urlparse(base_url)
+    q = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    q.update({"station": station_upper, "email": email, "sig": sig})
+    new_query = urllib.parse.urlencode(q)
+
+    rebuilt = parsed._replace(query=new_query)
+    return urllib.parse.urlunparse(rebuilt)
+
+
+# ----------------------------
+# Template loading
+# ----------------------------
+def load_message_template() -> str:
+    """
+    Loads the email body template text.
+    Supports either:
+      BASE_DIR/templates/camera_only_down.txt
+      BASE_DIR/camera_only_down.txt
+    """
+    for path in (MESSAGE_FILE_PRIMARY, MESSAGE_FILE_FALLBACK):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            logger.exception(f"Could not read message template: {path}")
+            return ""
+    logger.error(f"Message template not found in {MESSAGE_FILE_PRIMARY} or {MESSAGE_FILE_FALLBACK}")
+    return ""
+
+
+# ----------------------------
 # Email sending
 # ----------------------------
 def send_alert_email(station: str):
@@ -126,50 +191,62 @@ def send_alert_email(station: str):
         logger.info(f"{station}: user unsubscribed, no email sent")
         return
 
-    try:
-        with open(MESSAGE_FILE, encoding="utf-8") as f:
-            body = f.read()
-    except Exception:
-        logger.exception(f"Could not read message template: {MESSAGE_FILE}")
+    template = load_message_template()
+    if not template:
         return
 
-    unsubscribe_link = ""
-    if UNSUB_BASE_URL:
-        unsubscribe_link = f"{UNSUB_BASE_URL}?station={station}&email={email}"
+    # Use first-offline time if available, otherwise "now"
+    first_offline = offline_since.get(station) or datetime.now(timezone.utc)
 
-    html = f"""
-    <p>{body}</p>
-    <hr>
-    <p style="font-size: small;">
-      To stop receiving these alerts,
-      <a href="{unsubscribe_link}">unsubscribe here</a>.
-    </p>
-    """ if unsubscribe_link else f"<p>{body}</p>"
+    station_upper = station.upper()
+    time_str = first_offline.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    unsubscribe_link = build_unsubscribe_link(UNSUB_BASE_URL, station_upper, email)
+
+    # Fill placeholders in template: {station}, {time}, {unsubscribe_link}
+    try:
+        body_text = template.format(
+            station=station_upper,
+            time=time_str,
+            unsubscribe_link=unsubscribe_link or "(unsubscribe link unavailable)",
+        )
+    except Exception:
+        logger.exception("Template format error (check {station}, {time}, {unsubscribe_link})")
+        return
+
+    # Convert text -> safe HTML with line breaks
+    body_html = "<br>".join(htmlmod.escape(line) for line in body_text.splitlines())
+
+    # Add a clickable URL footer as well (helps some email clients)
+    if unsubscribe_link:
+        safe_url = htmlmod.escape(unsubscribe_link, quote=True)
+        body_html += (
+            "<hr>"
+            '<p style="font-size: small;">'
+            'Unsubscribe link (opens a confirmation page): '
+            f'<a href="{safe_url}">{safe_url}</a>'
+            "</p>"
+        )
 
     data = {
         "Messages": [{
-            "From": {
-                "Email": FROM_EMAIL,
-                "Name": FROM_NAME
-            },
-            "To": [{
-                "Email": email
-            }],
-            "Subject": f"Camera offline alert: {station}",
-            "HTMLPart": html
+            "From": {"Email": FROM_EMAIL, "Name": FROM_NAME},
+            "To": [{"Email": email}],
+            "Subject": f"Camera offline alert: {station_upper}",
+            "HTMLPart": f"<p>{body_html}</p>",
         }]
     }
 
-    logger.info(f"Sending email alert for {station} to {email}")
+    logger.info(f"Sending email alert for {station_upper} to {email}")
     try:
         result = mailjet.send.create(data=data)
         logger.info(f"Mailjet response: {result.status_code} {result.json()}")
         if result.status_code == 200:
-            logger.info(f"Alert email sent for {station}")
+            logger.info(f"Alert email sent for {station_upper}")
         else:
-            logger.error(f"Mailjet error for {station}")
+            logger.error(f"Mailjet error for {station_upper}")
     except Exception:
-        logger.exception(f"Mailjet exception for {station}")
+        logger.exception(f"Mailjet exception for {station_upper}")
 
 
 # ----------------------------
@@ -203,7 +280,7 @@ def on_message(client, userdata, msg):
         metric = (parts[2] or "").strip().lower()
         now = datetime.now(timezone.utc)
 
-        # Track activity (not used for alerting anymore, but handy for debugging/health)
+        # Track activity (debug/health)
         last_seen[station] = now
 
         # --- Alert logic based on camerastatus ---

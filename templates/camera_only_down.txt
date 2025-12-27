@@ -5,7 +5,7 @@ No messages have been received since:
 
 This indicates the camera may be offline.
 
-If you no longer wish to receive these alerts, unsubscribe here:
-{sig = HMAC_SHA256(secret, f"{station}|{email}")
-unsubscribe_link = f"{base}/unsubscribe?station={station}&email={email}&sig={sig}"
-}
+Unsubscribe from these alerts:
+{unsubscribe_link}
+
+Note: the link will open a confirmation page before you are unsubscribed.
