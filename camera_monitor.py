@@ -215,18 +215,28 @@ def send_alert_email(station: str):
         return
 
     # Convert text -> safe HTML with line breaks
-    body_html = "<br>".join(htmlmod.escape(line) for line in body_text.splitlines())
+    lines = [htmlmod.escape(line) for line in body_text.splitlines()]
+    body_html = "<br>".join(lines)
 
-    # Add a clickable URL footer as well (helps some email clients)
+    # If we have an unsubscribe link, make it a clickable anchor
     if unsubscribe_link:
-        safe_url = htmlmod.escape(unsubscribe_link, quote=True)
+        safe_url_text = htmlmod.escape(unsubscribe_link)
+        safe_url_href = htmlmod.escape(unsubscribe_link, quote=True)
+
+        # Replace the plain URL occurrence with a clickable link
+        body_html = body_html.replace(
+            safe_url_text,
+            f'<a href="{safe_url_href}">{safe_url_text}</a>'
+        )
+
         body_html += (
             "<hr>"
             '<p style="font-size: small;">'
-            'Unsubscribe link (opens a confirmation page): '
-            f'<a href="{safe_url}">{safe_url}</a>'
+            "Unsubscribe link (opens a confirmation page): "
+            f'<a href="{safe_url_href}">{safe_url_text}</a>'
             "</p>"
         )
+
 
     data = {
         "Messages": [{

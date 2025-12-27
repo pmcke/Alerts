@@ -10,39 +10,53 @@ app = Flask(__name__)
 DB_PATH = "/home/pmcke/Alerts/stations.db"
 SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
 
-def make_sig(station: str, email: str) -> str:
+
+# -------------------------------------------------
+# HMAC signing (USES UPPERCASE STATION)
+# -------------------------------------------------
+def make_sig(station_upper: str, email: str) -> str:
     if not SECRET:
         raise RuntimeError("UNSUBSCRIBE_SECRET not set")
-    msg = f"{station}|{email}".encode("utf-8")
+    msg = f"{station_upper}|{email}".encode("utf-8")
     return hmac.new(SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
-def verify_sig(station: str, email: str, sig: str) -> bool:
+
+def verify_sig(station_upper: str, email: str, sig: str) -> bool:
     if not SECRET:
         return False
-    expected = make_sig(station, email)
+    expected = make_sig(station_upper, email)
     return hmac.compare_digest(expected, sig or "")
 
-def db_get_unsubscribed(station_u: str, email: str):
+
+# -------------------------------------------------
+# Database helpers (USE LOWERCASE STATION)
+# -------------------------------------------------
+def db_get_unsubscribed(station_db: str, email: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         "SELECT unsubscribed FROM stations WHERE station = ? AND email = ?",
-        (station_u, email),
+        (station_db, email),
     )
     row = cur.fetchone()
     conn.close()
     return row
 
-def db_set_unsubscribed(station_u: str, email: str):
+
+def db_set_unsubscribed(station_db: str, email: str):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     cur.execute(
         "UPDATE stations SET unsubscribed = 1 WHERE station = ? AND email = ?",
-        (station_u, email),
+        (station_db, email),
     )
     conn.commit()
     conn.close()
 
+
+# -------------------------------------------------
+# GET: confirmation page
+# -------------------------------------------------
 @app.route("/unsubscribe", methods=["GET"])
 def unsubscribe_confirm():
     station = (request.args.get("station") or "").strip()
@@ -52,18 +66,21 @@ def unsubscribe_confirm():
     if not station or not email or not sig:
         abort(400)
 
-    station_u = station.upper()
+    station_upper = station.upper()
+    station_db = station_upper.lower()
 
-    if not verify_sig(station_u, email, sig):
+    # Signature must match UPPERCASE station
+    if not verify_sig(station_upper, email, sig):
         abort(403)
 
-    row = db_get_unsubscribed(station_u, email)
+    # DB lookup must use lowercase station
+    row = db_get_unsubscribed(station_db, email)
     if not row:
         abort(404)
 
     already = int(row[0] or 0) == 1
 
-    station_html = html.escape(station_u)
+    station_html = html.escape(station_upper)
     email_html = html.escape(email)
     sig_html = html.escape(sig)
 
@@ -87,6 +104,10 @@ def unsubscribe_confirm():
     <p><a href="https://alerts.mckellar.nz/">No, keep me subscribed</a></p>
     """
 
+
+# -------------------------------------------------
+# POST: perform unsubscribe
+# -------------------------------------------------
 @app.route("/unsubscribe/confirm", methods=["POST"])
 def unsubscribe_do():
     station = (request.form.get("station") or "").strip()
@@ -96,22 +117,28 @@ def unsubscribe_do():
     if not station or not email or not sig:
         abort(400)
 
-    station_u = station.upper()
+    station_upper = station.upper()
+    station_db = station_upper.lower()
 
-    if not verify_sig(station_u, email, sig):
+    # Signature check (UPPERCASE)
+    if not verify_sig(station_upper, email, sig):
         abort(403)
 
-    row = db_get_unsubscribed(station_u, email)
+    # DB lookup/update (lowercase)
+    row = db_get_unsubscribed(station_db, email)
     if not row:
         abort(404)
 
-    db_set_unsubscribed(station_u, email)
+    db_set_unsubscribed(station_db, email)
 
     return f"""
     <h2>Unsubscribed</h2>
-    <p>You will no longer receive alerts for station <b>{html.escape(station_u)}</b>.</p>
+    <p>You will no longer receive alerts for station <b>{html.escape(station_upper)}</b>.</p>
     """
 
+
+# -------------------------------------------------
+# Run locally only (Cloudflare Tunnel exposes it)
+# -------------------------------------------------
 if __name__ == "__main__":
-    # Localhost only — Cloudflare Tunnel provides external access
     app.run(host="127.0.0.1", port=8081)
