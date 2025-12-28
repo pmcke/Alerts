@@ -2,3 +2,4 @@ camera_monitor.log
 config.ini
 stations.db
 venv
+*.deb
