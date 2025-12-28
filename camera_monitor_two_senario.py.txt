@@ -29,13 +29,11 @@ TEMPLATE_DIR_FALLBACK = BASE_DIR
 
 TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.txt"
 TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.txt"
-TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.txt"
 
 # ----------------------------
 # Logging (file + stdout for journalctl)
 # ----------------------------
 logger = logging.getLogger("camera_monitor")
-# Default WARNING; change to INFO if you want per-message logs in journalctl
 logger.setLevel(logging.WARNING)
 
 log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
@@ -72,13 +70,9 @@ TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 # Optional: separate "silence" timeout (no MQTT messages at all)
 SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=TIMEOUT_MINUTES)
 
-# Scenario C: "hasn't rebooted"
-REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
-
 # Optional: enable/disable each scenario independently
 ENABLE_SCENARIO_CAMERA_STATUS = config.getboolean("monitor", "enable_camera_status_scenario", fallback=True)
 ENABLE_SCENARIO_SILENCE = config.getboolean("monitor", "enable_silence_scenario", fallback=True)
-ENABLE_SCENARIO_REBOOT = config.getboolean("monitor", "enable_reboot_scenario", fallback=True)
 
 # Mailjet
 MAILJET_API_KEY = config.get("mailjet", "api_key", fallback="")
@@ -153,27 +147,6 @@ def get_active_stations():
         SELECT station
         FROM stations
         WHERE COALESCE(unsubscribed, 0) = 0
-        """
-    )
-    rows = cur.fetchall()
-    conn.close()
-    return [str(r[0]).strip().lower() for r in rows if r and r[0]]
-
-
-def get_reboot_watch_stations():
-    """
-    Return list of stations (lowercase) that should receive "hasn't rebooted" alerts:
-    - reboot = 1
-    - unsubscribed = 0
-    """
-    conn = db_connect()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT station
-        FROM stations
-        WHERE COALESCE(reboot, 0) = 1
-          AND COALESCE(unsubscribed, 0) = 0
         """
     )
     rows = cur.fetchall()
@@ -348,6 +321,14 @@ class ScenarioCameraStatusDown:
                 logger.warning(f"{station} camerastatus=0 (first seen at {now.isoformat()})")
 
         elif payload == "1":
+            if station in self.offline_since:
+                started = self.offline_since.get(station)
+                duration = (now - started) if started else None
+                if duration:
+                    mins = duration.total_seconds() / 60.0
+                    logger.info(f"{station} recovered (camerastatus=1) after {mins:.1f} min offline")
+                else:
+                    logger.info(f"{station} recovered (camerastatus=1)")
             self.offline_since.pop(station, None)
             self.alert_sent.discard(station)
 
@@ -386,16 +367,20 @@ class ScenarioPiAndCameraDown:
 
             if not seen:
                 # Never seen since process started.
+                # Start "silent since" on first check so we don't instantly alert.
                 if station not in self.silent_since:
                     self.silent_since[station] = now
                 continue
 
+            # If recently seen, clear silence state
             if (now - seen) <= self.timeout:
                 self.silent_since.pop(station, None)
                 self.alert_sent.discard(station)
                 continue
 
+            # If silent longer than timeout, ensure silent_since reflects earliest point we noticed
             if station not in self.silent_since:
+                # Set to last seen time to make the email more truthful
                 self.silent_since[station] = seen
 
             silent_start = self.silent_since[station]
@@ -413,108 +398,9 @@ class ScenarioPiAndCameraDown:
                         template_vars={
                             "last_seen": last_seen_str,
                             "minutes": str(int((now - seen).total_seconds() // 60)) if seen else "unknown",
-                            "time": last_seen_str,  # alias for older templates that used {time}
                         },
                     )
                     self.alert_sent.add(station)
-
-
-class ScenarioHasntRebooted:
-    """
-    Scenario C: station is flagged reboot=1 in DB and unsubscribed=0,
-    and the station's 'meteorcams/<station>/lastboot' timestamp is older than
-    REBOOT_THRESHOLD_HOURS before now (UTC).
-
-    Uses TEMPLATE_HASNT_REBOOTED.
-    """
-    def __init__(self, threshold_hours: int):
-        self.threshold = timedelta(hours=threshold_hours)
-        self.lastboot = {}         # station -> datetime (UTC) parsed from payload
-        self.alerted_for = {}      # station -> datetime lastboot value we already alerted on (prevents spam)
-
-    def _parse_lastboot_utc(self, s: str):
-        """
-        Parse lastboot string.
-        Expected: "YYYY-MM-DD HH:MM:SS" (UTC).
-        Also accepts ISO forms with T/Z.
-        """
-        if not s:
-            return None
-        s = s.strip()
-        try:
-            # "2025-12-27 17:01:01"
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            return dt
-        except Exception:
-            pass
-
-        # Try ISO-ish variants
-        try:
-            s2 = s.replace("Z", "+00:00")
-            dt = datetime.fromisoformat(s2)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            else:
-                dt = dt.astimezone(timezone.utc)
-            return dt
-        except Exception:
-            return None
-
-    def handle_mqtt(self, station: str, metric: str, payload: str, now: datetime):
-        if metric != "lastboot":
-            return
-
-        parsed = self._parse_lastboot_utc(payload)
-        if not parsed:
-            logger.warning(f"{station} lastboot payload could not be parsed: {payload!r}")
-            return
-
-        prev = self.lastboot.get(station)
-        self.lastboot[station] = parsed
-
-        # If the station rebooted (lastboot moved forward), allow future alerts
-        if station in self.alerted_for:
-            if prev is None:
-                # don't know
-                pass
-            elif parsed > self.alerted_for[station]:
-                self.alerted_for.pop(station, None)
-
-    def check_and_alert(self, now: datetime):
-        watch = get_reboot_watch_stations()
-
-        for station in watch:
-            lb = self.lastboot.get(station)
-            if not lb:
-                # We haven't seen a lastboot for this station since service start.
-                continue
-
-            age = now - lb
-            if age <= self.threshold:
-                # Healthy: clear any alert lock if it exists
-                self.alerted_for.pop(station, None)
-                continue
-
-            # Only alert once per distinct "lastboot" value
-            already = self.alerted_for.get(station)
-            if already and already == lb:
-                continue
-
-            hours = age.total_seconds() / 3600.0
-            lb_str = lb.strftime("%Y-%m-%d %H:%M:%S UTC")
-            logger.warning(
-                f"{station} has not rebooted for {hours:.2f} hours (lastboot {lb_str})"
-            )
-            send_email(
-                station=station,
-                subject=f"Reboot failure alert: {station.upper()}",
-                template_filename=TEMPLATE_HASNT_REBOOTED,
-                template_vars={
-                    "lastboot": lb_str,
-                    "hours": f"{hours:.2f}",
-                },
-            )
-            self.alerted_for[station] = lb
 
 
 # ----------------------------
@@ -522,7 +408,6 @@ class ScenarioHasntRebooted:
 # ----------------------------
 scenario_a = ScenarioCameraStatusDown(timeout_minutes=TIMEOUT_MINUTES) if ENABLE_SCENARIO_CAMERA_STATUS else None
 scenario_b = ScenarioPiAndCameraDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if ENABLE_SCENARIO_SILENCE else None
-scenario_c = ScenarioHasntRebooted(threshold_hours=REBOOT_THRESHOLD_HOURS) if ENABLE_SCENARIO_REBOOT else None
 
 
 def on_connect(client, userdata, flags, rc, properties=None):
@@ -542,7 +427,7 @@ def on_message(client, userdata, msg):
     try:
         payload = msg.payload.decode(errors="ignore").strip()
 
-        # Log every message only if INFO enabled
+        # Log EVERY message so you can confirm receipt
         logger.info(f"MQTT RX topic={msg.topic} payload={payload}")
 
         parts = msg.topic.split("/")
@@ -559,9 +444,6 @@ def on_message(client, userdata, msg):
         # Feed scenario modules
         if scenario_a:
             scenario_a.handle_mqtt(station, metric, payload, now)
-
-        if scenario_c:
-            scenario_c.handle_mqtt(station, metric, payload, now)
 
         # (Scenario B is time-based; no per-message handling required)
 
@@ -582,9 +464,6 @@ def monitor_loop():
         if scenario_b:
             scenario_b.check_and_alert(now)
 
-        if scenario_c:
-            scenario_c.check_and_alert(now)
-
         time.sleep(CHECK_INTERVAL)
 
 
@@ -592,13 +471,13 @@ def monitor_loop():
 # Main
 # ----------------------------
 def main():
+    logger.debug(f"Starting camera monitor. MQTT host={MQTT_HOST} port={MQTT_PORT}")
     logger.info(
         f"Timeout minutes={TIMEOUT_MINUTES}, silence timeout minutes={SILENCE_TIMEOUT_MINUTES}, "
-        f"reboot threshold hours={REBOOT_THRESHOLD_HOURS}, check interval seconds={CHECK_INTERVAL}"
+        f"check interval seconds={CHECK_INTERVAL}"
     )
     logger.info(
-        f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} "
-        f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT}"
+        f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} silence={ENABLE_SCENARIO_SILENCE}"
     )
 
     client = mqtt.Client()
