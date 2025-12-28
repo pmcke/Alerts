@@ -1,0 +1,27 @@
+[mqtt]
+host = YOUR MQTT BROKER
+port = 8883
+username = YOUR MQTT BROKER 
+password = YOUR MQTT BROKER PASSWORD
+
+[monitor]
+# Existing
+timeout_minutes = 15
+check_interval_seconds = 60
+
+silence_timeout_minutes = 15
+reboot_threshold_hours = 30
+
+# enable/disable scenarios independently
+enable_camera_status_scenario = true
+enable_silence_scenario = true
+enable_reboot_scenario = true
+
+[mailjet]
+api_key = YOUR API KEY
+api_secret = YOUR API SECRET
+from_email = YOUR FROM EMAIL
+from_name = YOUR EMAIL NAME
+unsubscribe_url = YOUR UNSUBSCRIBE URL
+
+
