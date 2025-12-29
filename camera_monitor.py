@@ -16,39 +16,30 @@ import paho.mqtt.client as mqtt
 from mailjet_rest import Client
 
 # ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+logger = logging.getLogger("camera_monitor")
+
+# ----------------------------
 # Paths
 # ----------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Default DB + config paths (can be overridden in config.ini if you add entries later)
 DB_PATH = os.path.join(BASE_DIR, "stations.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 
-# Templates:
-# Prefer <working directory>/templates/<template>.txt but fallback to /<working directory>/<template>.txt
+# Templates: primary (your working dir) + fallback (system path)
 TEMPLATE_DIR_PRIMARY = os.path.join(BASE_DIR, "templates")
-TEMPLATE_DIR_FALLBACK = BASE_DIR
+TEMPLATE_DIR_FALLBACK = "/etc/camera-monitor/templates"
 
-TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.txt"
-TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.txt"
-TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.txt"
-
-# ----------------------------
-# Logging (file + stdout for journalctl)
-# ----------------------------
-logger = logging.getLogger("camera_monitor")
-# Default WARNING; change to INFO if you want per-message logs in journalctl
-logger.setLevel(logging.WARNING)
-
-log_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-
-# File log
-file_handler = logging.FileHandler(os.path.join(BASE_DIR, "camera_monitor.log"))
-file_handler.setFormatter(log_fmt)
-logger.addHandler(file_handler)
-
-# Stdout log (captured by systemd journal)
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setFormatter(log_fmt)
-logger.addHandler(stream_handler)
+TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.html"
+TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.html"
+TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.html"
 
 # ----------------------------
 # Load config
@@ -64,6 +55,7 @@ MQTT_HOST = config.get("mqtt", "host", fallback="")
 MQTT_PORT = config.getint("mqtt", "port", fallback=8883)
 MQTT_USER = config.get("mqtt", "username", fallback="")
 MQTT_PASS = config.get("mqtt", "password", fallback="")
+MQTT_TOPIC = config.get("mqtt", "topic", fallback="meteorcams/#")
 
 # Monitor
 CHECK_INTERVAL = config.getint("monitor", "check_interval_seconds", fallback=60)
@@ -88,18 +80,18 @@ ENABLE_SCENARIO_REBOOT = config.getboolean("monitor", "enable_reboot_scenario", 
 MAILJET_API_KEY = config.get("mailjet", "api_key", fallback="")
 MAILJET_SECRET = config.get("mailjet", "api_secret", fallback="")
 FROM_EMAIL = config.get("mailjet", "from_email", fallback="")
-FROM_NAME = config.get("mailjet", "from_name", fallback="Meteor Camera Alerts")
+FROM_NAME = config.get("mailjet", "from_name", fallback="Camera Alerts")
+
+# Unsubscribe URL base (points to your unsubscribe web service)
 UNSUB_BASE_URL = config.get("mailjet", "unsubscribe_url", fallback="").strip()
 
-# Mailjet BCC (optional)
+# Optional Mailjet BCC list (comma-separated in config.ini)
 MAILJET_BCC = [
-    e.strip()
-    for e in config.get("mailjet", "bcc_emails", fallback="").split(",")
-    if e.strip()
+    e.strip() for e in config.get("mailjet", "bcc_emails", fallback="").split(",") if e.strip()
 ]
 
-# Unsubscribe signing secret (must match what unsubscribe.py expects)
-UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "").strip()
+# Secret used to HMAC-sign unsubscribe links (recommended in env var)
+UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
 
 # Basic config sanity checks (don’t print secrets)
 if not MQTT_HOST:
@@ -142,13 +134,18 @@ def get_recipient(station: str):
         """
         SELECT email, unsubscribed
         FROM stations
-        WHERE station = ?
+        WHERE LOWER(station) = ?
+        LIMIT 1
         """,
         (station,),
     )
     row = cur.fetchone()
     conn.close()
-    return row
+    if not row:
+        return None
+    email = (row[0] or "").strip()
+    unsubscribed = int(row[1] or 0)
+    return email, unsubscribed
 
 
 def get_active_stations():
@@ -173,7 +170,7 @@ def get_active_stations():
 
 def get_reboot_watch_stations():
     """
-    Return list of stations (lowercase) that should receive "hasn't rebooted" alerts:
+    Return list of stations (lowercase) that should be checked for reboot issues:
     - reboot = 1
     - unsubscribed = 0
     """
@@ -190,7 +187,6 @@ def get_reboot_watch_stations():
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
-
 
 
 # ----------------------------
@@ -342,11 +338,6 @@ def _hmac_sig(station_upper: str, email: str) -> str:
 
 
 def build_unsubscribe_link(base_url: str, station_upper: str, email: str) -> str:
-    """
-    Build a signed unsubscribe URL:
-      <base_url>?station=STATION&email=EMAIL&sig=HMAC
-    Returns "" if base_url or secret missing.
-    """
     if not base_url or not UNSUBSCRIBE_SECRET:
         return ""
 
@@ -365,14 +356,11 @@ def build_unsubscribe_link(base_url: str, station_upper: str, email: str) -> str
 # Template loading
 # ----------------------------
 def load_template(template_filename: str) -> str:
-    """
-    Loads the email body template text.
-    Supports either:
-      BASE_DIR/templates/<template_filename>
-      BASE_DIR/<template_filename>
-    """
-    for folder in (TEMPLATE_DIR_PRIMARY, TEMPLATE_DIR_FALLBACK):
-        path = os.path.join(folder, template_filename)
+    candidates = [
+        os.path.join(TEMPLATE_DIR_PRIMARY, template_filename),
+        os.path.join(TEMPLATE_DIR_FALLBACK, template_filename),
+    ]
+    for path in candidates:
         try:
             with open(path, encoding="utf-8") as f:
                 return f.read()
@@ -412,82 +400,52 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
         logger.info(f"{station}: user unsubscribed, no email sent")
         return
 
-    template = load_template(template_filename)
-    if not template:
+    station_upper = station.upper()
+    unsub_link = build_unsubscribe_link(UNSUB_BASE_URL, station_upper, email)
+
+    tpl = load_template(template_filename)
+    if not tpl:
+        logger.error(f"{station}: template missing {template_filename}, cannot send email")
         return
 
-    station_upper = station.upper()
-    unsubscribe_link = build_unsubscribe_link(UNSUB_BASE_URL, station_upper, email)
-
-    # Always include station + unsubscribe_link in the template vars
-    vars_full = dict(template_vars or {})
-    vars_full.setdefault("station", station_upper)
-    vars_full.setdefault("unsubscribe_link", unsubscribe_link or "(unsubscribe link unavailable)")
+    merged = dict(template_vars or {})
+    merged.setdefault("station", htmlmod.escape(station_upper))
+    merged.setdefault("unsubscribe_link", htmlmod.escape(unsub_link) if unsub_link else "")
+    merged.setdefault("unsubscribe_url", htmlmod.escape(unsub_link) if unsub_link else "")
 
     try:
-        body_text = template.format(**vars_full)
+        body_html = tpl.format(**merged)
     except Exception:
-        logger.exception(
-            f"Template format error for {template_filename} "
-            f"(check placeholders match keys: {sorted(vars_full.keys())})"
-        )
+        logger.exception(f"{station}: template formatting failed for {template_filename}")
         return
 
-    # Convert text -> safe HTML with line breaks
-    lines = [htmlmod.escape(line) for line in body_text.splitlines()]
-    body_html = "<br>".join(lines)
-
-    # If we have an unsubscribe link, make it a clickable anchor and append footer
-    if unsubscribe_link:
-        safe_url_text = htmlmod.escape(unsubscribe_link)
-        safe_url_href = htmlmod.escape(unsubscribe_link, quote=True)
-
-        body_html = body_html.replace(
-            safe_url_text,
-            f'<a href="{safe_url_href}">{safe_url_text}</a>'
-        )
-
-        body_html += (
-            "<hr>"
-            '<p style="font-size: small;">'
-            "Unsubscribe link (opens a confirmation page): "
-            f'<a href="{safe_url_href}">{safe_url_text}</a>'
-            "</p>"
-        )
-
-    data = {
-        "Messages": [{
-            "From": {"Email": FROM_EMAIL, "Name": FROM_NAME},
-            "To": [{"Email": email}],
-            "Subject": subject,
-            "HTMLPart": f"<p>{body_html}</p>",
-        }]
+    message = {
+        "From": {"Email": FROM_EMAIL, "Name": FROM_NAME},
+        "To": [{"Email": email}],
+        "Subject": subject,
+        "HTMLPart": body_html,
     }
 
-    logger.info(f"Sending email alert for {station_upper} to {email} (template={template_filename})")
+    # Optional BCC
+    if MAILJET_BCC:
+        message["Bcc"] = [{"Email": addr} for addr in MAILJET_BCC]
+
+    data = {"Messages": [message]}
+
     try:
         result = mailjet.send.create(data=data)
-        logger.info(f"Mailjet response: {result.status_code} {result.json()}")
-        if result.status_code == 200:
-            logger.info(f"Alert email sent for {station_upper}")
+        if result.status_code >= 300:
+            logger.error(f"{station}: Mailjet error {result.status_code}: {result.json()}")
         else:
-            logger.error(f"Mailjet error for {station_upper}")
+            logger.info(f"{station}: email sent: {subject}")
     except Exception:
-        logger.exception(f"Mailjet exception for {station_upper}")
+        logger.exception(f"{station}: Mailjet send failed")
 
 
-# ======================================================================
-# Scenarios (modular)
-# ======================================================================
-
+# ----------------------------
+# Scenarios
+# ----------------------------
 class ScenarioCameraStatusDown:
-    """
-    Scenario A: camera publishes meteorcams/<station>/camerastatus = 0 continuously for > TIMEOUT_MINUTES.
-
-    - Sends initial email once the timeout is exceeded
-    - If still down, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
-    - After that, marks station unsubscribed in DB
-    """
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
         self.offline_since = {}  # station -> datetime when camerastatus first became 0
@@ -502,7 +460,6 @@ class ScenarioCameraStatusDown:
                 logger.warning(f"{station} camerastatus=0 (first seen at {now.isoformat()})")
 
         elif payload == "1":
-            # Condition cleared: reset reminder state
             self.offline_since.pop(station, None)
             clear_alert_state(station, "camera_status_down")
 
@@ -523,9 +480,6 @@ class ScenarioCameraStatusDown:
                 continue
 
             time_str = first_offline.strftime("%Y-%m-%d %H:%M:%S UTC")
-            logger.warning(
-                f"{station} camerastatus still 0 for > {int(self.timeout.total_seconds()/60)} min"
-            )
             send_email(
                 station=station,
                 subject=f"Camera offline alert: {station.upper()}",
@@ -535,21 +489,10 @@ class ScenarioCameraStatusDown:
             record_alert_sent(station, "camera_status_down", now)
 
 
-
 class ScenarioPiAndCameraDown:
-    """
-    Scenario B: no MQTT messages received from a DB-listed station (unsubscribed=0)
-    for > SILENCE_TIMEOUT_MINUTES.
-
-    - Sends initial email once the silence timeout is exceeded
-    - If still silent, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
-    - After that, marks station unsubscribed in DB
-
-    Uses TEMPLATE_PI_AND_CAMERA_DOWN
-    """
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
-        self.silent_since = {}    # station -> datetime when silence began (approx)
+        self.silent_since = {}
 
     def check_and_alert(self, now: datetime):
         active = get_active_stations()
@@ -557,15 +500,12 @@ class ScenarioPiAndCameraDown:
         for station in active:
             seen = last_seen.get(station)
 
-            # If we've seen a message within the silence timeout, clear state
             if seen and (now - seen) <= self.timeout:
                 self.silent_since.pop(station, None)
                 clear_alert_state(station, "silence_down")
                 continue
 
-            # Start silence window (if not started yet)
             if station not in self.silent_since:
-                # If we have never seen the station since service start, use "now" as best estimate
                 self.silent_since[station] = seen or now
                 continue
 
@@ -588,10 +528,6 @@ class ScenarioPiAndCameraDown:
             last_seen_str = seen.strftime("%Y-%m-%d %H:%M:%S UTC") if seen else "unknown"
             minutes = str(int((now - seen).total_seconds() // 60)) if seen else "unknown"
 
-            logger.warning(
-                f"{station} has had no MQTT messages for > {int(self.timeout.total_seconds()/60)} min "
-                f"(last seen {last_seen_str})"
-            )
             send_email(
                 station=station,
                 subject=f"Pi/camera offline alert: {station.upper()}",
@@ -599,43 +535,28 @@ class ScenarioPiAndCameraDown:
                 template_vars={
                     "last_seen": last_seen_str,
                     "minutes": minutes,
-                    "time": last_seen_str,  # alias for older templates that used {time}
+                    "time": last_seen_str,
                 },
             )
             record_alert_sent(station, "silence_down", now)
 
 
-
 class ScenarioHasntRebooted:
-    """
-    Scenario C: station is flagged reboot=1 in DB and unsubscribed=0,
-    and the station's 'meteorcams/<station>/lastboot' timestamp is older than
-    REBOOT_THRESHOLD_HOURS before now (UTC).
-
-    - Sends initial email once threshold exceeded
-    - If still stale, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
-    - After that, marks station unsubscribed in DB
-
-    Uses TEMPLATE_HASNT_REBOOTED.
-    """
     def __init__(self, threshold_hours: int):
         self.threshold = timedelta(hours=threshold_hours)
-        self.lastboot = {}  # station -> datetime (UTC) parsed from payload
+        self.lastboot = {}
 
     def _parse_lastboot_utc(self, s: str):
-        """Parse lastboot string as UTC."""
         if not s:
             return None
         s = str(s).strip()
 
-        # Common GMN/RMS format: "YYYY-MM-DD HH:MM:SS"
         try:
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             return dt
         except Exception:
             pass
 
-        # Try ISO-ish variants
         try:
             s2 = s.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s2)
@@ -659,7 +580,6 @@ class ScenarioHasntRebooted:
         prev = self.lastboot.get(station)
         self.lastboot[station] = parsed
 
-        # If lastboot moved forward, the issue is likely resolved; reset reminder state
         if prev and parsed > prev:
             clear_alert_state(station, "hasnt_rebooted")
 
@@ -669,7 +589,6 @@ class ScenarioHasntRebooted:
         for station in watch:
             lb = self.lastboot.get(station)
             if not lb:
-                # We haven't seen a lastboot for this station since service start.
                 continue
 
             age = now - lb
@@ -690,9 +609,6 @@ class ScenarioHasntRebooted:
             if action == "skip":
                 continue
 
-            logger.warning(
-                f"{station} has not rebooted for {hours:.2f} hours (lastboot {lb_str})"
-            )
             send_email(
                 station=station,
                 subject=f"Reboot failure alert: {station.upper()}",
@@ -705,7 +621,6 @@ class ScenarioHasntRebooted:
             record_alert_sent(station, "hasnt_rebooted", now)
 
 
-
 # ----------------------------
 # MQTT callbacks
 # ----------------------------
@@ -714,45 +629,38 @@ scenario_b = ScenarioPiAndCameraDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if
 scenario_c = ScenarioHasntRebooted(threshold_hours=REBOOT_THRESHOLD_HOURS) if ENABLE_SCENARIO_REBOOT else None
 
 
-def on_connect(client, userdata, flags, rc, properties=None):
-    logger.info(f"MQTT on_connect rc={rc}")
+def on_connect(client, userdata, flags, rc):
     if rc == 0:
-        logger.info("Connected to MQTT broker, subscribing to meteorcams/+/+")
-        client.subscribe("meteorcams/+/+")
+        logger.info("MQTT connected OK")
+        client.subscribe(MQTT_TOPIC)
+        logger.info(f"Subscribed to {MQTT_TOPIC}")
     else:
-        logger.error("MQTT connect failed (check host/port/TLS/username/password)")
-
-
-def on_disconnect(client, userdata, rc, properties=None):
-    logger.warning(f"MQTT disconnected rc={rc}")
+        logger.error(f"MQTT connection failed rc={rc}")
 
 
 def on_message(client, userdata, msg):
     try:
-        payload = msg.payload.decode(errors="ignore").strip()
+        topic = (msg.topic or "").strip()
+        payload = msg.payload.decode("utf-8", errors="ignore").strip()
 
-        # Log every message only if INFO enabled
-        logger.info(f"MQTT RX topic={msg.topic} payload={payload}")
-
-        parts = msg.topic.split("/")
+        parts = topic.split("/")
         if len(parts) < 3:
+            return
+
+        if parts[0].lower() != "meteorcams":
             return
 
         station = (parts[1] or "").strip().lower()
         metric = (parts[2] or "").strip().lower()
         now = datetime.now(timezone.utc)
 
-        # Track activity (for silence scenario + debug/health)
         last_seen[station] = now
 
-        # Feed scenario modules
         if scenario_a:
             scenario_a.handle_mqtt(station, metric, payload, now)
 
         if scenario_c:
             scenario_c.handle_mqtt(station, metric, payload, now)
-
-        # (Scenario B is time-based; no per-message handling required)
 
     except Exception:
         logger.exception("Error processing MQTT message")
@@ -790,7 +698,11 @@ def main():
         f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT}"
     )
 
-    # Ensure DB schema exists (including alert reminder state)
+    if MAILJET_BCC:
+        logger.info(f"Mailjet BCC enabled ({len(MAILJET_BCC)} recipient(s))")
+    else:
+        logger.info("Mailjet BCC not configured")
+
     ensure_alert_state_table()
 
     client = mqtt.Client()
@@ -798,19 +710,7 @@ def main():
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-    # --- TLS: REQUIRED for HiveMQ Cloud on 8883 ---
-    try:
-        client.tls_set()
-        client.tls_insecure_set(False)
-        logger.info("MQTT TLS enabled")
-    except Exception:
-        logger.exception("Failed to enable MQTT TLS (required for port 8883)")
-        raise
-
-    client.reconnect_delay_set(min_delay=1, max_delay=30)
-
     client.on_connect = on_connect
-    client.on_disconnect = on_disconnect
     client.on_message = on_message
 
     try:
