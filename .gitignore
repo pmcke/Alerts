@@ -3,3 +3,4 @@ config.ini
 stations.db
 venv
 *.deb
+*.bak
