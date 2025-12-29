@@ -75,6 +75,10 @@ SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fa
 # Scenario C: "hasn't rebooted"
 REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
 
+# Reminder/escalation (repeat alerts, then auto-unsubscribe)
+REMINDER_INTERVAL_HOURS = config.getint("monitor", "reminder_interval_hours", fallback=24)
+REMINDER_MAX_REPEATS = config.getint("monitor", "reminder_max_repeats", fallback=3)
+
 # Optional: enable/disable each scenario independently
 ENABLE_SCENARIO_CAMERA_STATUS = config.getboolean("monitor", "enable_camera_status_scenario", fallback=True)
 ENABLE_SCENARIO_SILENCE = config.getboolean("monitor", "enable_silence_scenario", fallback=True)
@@ -179,6 +183,147 @@ def get_reboot_watch_stations():
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
+
+
+
+# ----------------------------
+# Alert reminder state helpers (persisted in SQLite)
+# ----------------------------
+def ensure_alert_state_table():
+    """Create alert_state table if it doesn't exist."""
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS alert_state (
+          station TEXT NOT NULL,
+          scenario TEXT NOT NULL,
+          first_sent_utc TEXT NOT NULL,
+          last_sent_utc  TEXT NOT NULL,
+          send_count INTEGER NOT NULL DEFAULT 0,
+          PRIMARY KEY (station, scenario)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_alert_state(station: str, scenario: str):
+    station = (station or "").strip().lower()
+    scenario = (scenario or "").strip()
+    if not station or not scenario:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM alert_state WHERE station=? AND scenario=?",
+        (station, scenario),
+    )
+    conn.commit()
+    conn.close()
+
+
+def mark_station_unsubscribed(station: str, reason: str = ""):
+    station = (station or "").strip().lower()
+    if not station:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE stations SET unsubscribed=1 WHERE station=?",
+        (station,),
+    )
+    conn.commit()
+    conn.close()
+    logger.warning(f"{station}: auto-unsubscribed. reason={reason}")
+
+
+def _utc_iso(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def should_send_alert_now(station: str, scenario: str, now: datetime) -> str:
+    """Return: 'send', 'skip', or 'auto_unsub'.
+
+    Total allowed emails = 1 initial + REMINDER_MAX_REPEATS reminders.
+    """
+    station = (station or "").strip().lower()
+    scenario = (scenario or "").strip()
+    if not station or not scenario:
+        return "skip"
+
+    interval = timedelta(hours=REMINDER_INTERVAL_HOURS)
+    max_total_sends = 1 + max(0, int(REMINDER_MAX_REPEATS))
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT last_sent_utc, send_count
+        FROM alert_state
+        WHERE station=? AND scenario=?
+        """,
+        (station, scenario),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        # First send: create state row (send_count will become 1 after record_alert_sent)
+        now_iso = _utc_iso(now)
+        cur.execute(
+            """
+            INSERT INTO alert_state (station, scenario, first_sent_utc, last_sent_utc, send_count)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (station, scenario, now_iso, now_iso),
+        )
+        conn.commit()
+        conn.close()
+        return "send"
+
+    last_sent_utc, send_count = row
+
+    if int(send_count) >= max_total_sends:
+        conn.close()
+        return "auto_unsub"
+
+    # Parse last_sent
+    try:
+        s = str(last_sent_utc).replace("Z", "+00:00")
+        last_sent = datetime.fromisoformat(s)
+        if last_sent.tzinfo is None:
+            last_sent = last_sent.replace(tzinfo=timezone.utc)
+        else:
+            last_sent = last_sent.astimezone(timezone.utc)
+    except Exception:
+        last_sent = now - interval  # fail-safe: allow send
+
+    if (now - last_sent) < interval:
+        conn.close()
+        return "skip"
+
+    conn.close()
+    return "send"
+
+
+def record_alert_sent(station: str, scenario: str, now: datetime):
+    station = (station or "").strip().lower()
+    scenario = (scenario or "").strip()
+    if not station or not scenario:
+        return
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE alert_state
+        SET last_sent_utc=?, send_count=send_count+1
+        WHERE station=? AND scenario=?
+        """,
+        (_utc_iso(now), station, scenario),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ----------------------------
@@ -330,13 +475,15 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
 
 class ScenarioCameraStatusDown:
     """
-    Scenario A: camera reports camerastatus=0 continuously for > TIMEOUT_MINUTES
-    Uses TEMPLATE_CAMERA_ONLY_DOWN
+    Scenario A: camera publishes meteorcams/<station>/camerastatus = 0 continuously for > TIMEOUT_MINUTES.
+
+    - Sends initial email once the timeout is exceeded
+    - If still down, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
+    - After that, marks station unsubscribed in DB
     """
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
-        self.offline_since = {}   # station -> datetime of FIRST seen camerastatus=0
-        self.alert_sent = set()   # stations already alerted for current offline period
+        self.offline_since = {}  # station -> datetime when camerastatus first became 0
 
     def handle_mqtt(self, station: str, metric: str, payload: str, now: datetime):
         if metric != "camerastatus":
@@ -348,22 +495,38 @@ class ScenarioCameraStatusDown:
                 logger.warning(f"{station} camerastatus=0 (first seen at {now.isoformat()})")
 
         elif payload == "1":
+            # Condition cleared: reset reminder state
             self.offline_since.pop(station, None)
-            self.alert_sent.discard(station)
+            clear_alert_state(station, "camera_status_down")
 
     def check_and_alert(self, now: datetime):
         for station, first_offline in list(self.offline_since.items()):
-            if (now - first_offline) > self.timeout:
-                if station not in self.alert_sent:
-                    time_str = first_offline.strftime("%Y-%m-%d %H:%M:%S UTC")
-                    logger.warning(f"{station} camerastatus still 0 for > {int(self.timeout.total_seconds()/60)} min")
-                    send_email(
-                        station=station,
-                        subject=f"Camera offline alert: {station.upper()}",
-                        template_filename=TEMPLATE_CAMERA_ONLY_DOWN,
-                        template_vars={"time": time_str},
-                    )
-                    self.alert_sent.add(station)
+            if (now - first_offline) <= self.timeout:
+                continue
+
+            action = should_send_alert_now(station, "camera_status_down", now)
+
+            if action == "auto_unsub":
+                mark_station_unsubscribed(station, reason="camera_status_down not resolved after repeats")
+                clear_alert_state(station, "camera_status_down")
+                self.offline_since.pop(station, None)
+                continue
+
+            if action == "skip":
+                continue
+
+            time_str = first_offline.strftime("%Y-%m-%d %H:%M:%S UTC")
+            logger.warning(
+                f"{station} camerastatus still 0 for > {int(self.timeout.total_seconds()/60)} min"
+            )
+            send_email(
+                station=station,
+                subject=f"Camera offline alert: {station.upper()}",
+                template_filename=TEMPLATE_CAMERA_ONLY_DOWN,
+                template_vars={"time": time_str},
+            )
+            record_alert_sent(station, "camera_status_down", now)
+
 
 
 class ScenarioPiAndCameraDown:
@@ -371,12 +534,15 @@ class ScenarioPiAndCameraDown:
     Scenario B: no MQTT messages received from a DB-listed station (unsubscribed=0)
     for > SILENCE_TIMEOUT_MINUTES.
 
+    - Sends initial email once the silence timeout is exceeded
+    - If still silent, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
+    - After that, marks station unsubscribed in DB
+
     Uses TEMPLATE_PI_AND_CAMERA_DOWN
     """
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
         self.silent_since = {}    # station -> datetime when silence began (approx)
-        self.alert_sent = set()   # stations already alerted for current silent period
 
     def check_and_alert(self, now: datetime):
         active = get_active_stations()
@@ -384,39 +550,53 @@ class ScenarioPiAndCameraDown:
         for station in active:
             seen = last_seen.get(station)
 
-            if not seen:
-                # Never seen since process started.
-                if station not in self.silent_since:
-                    self.silent_since[station] = now
-                continue
-
-            if (now - seen) <= self.timeout:
+            # If we've seen a message within the silence timeout, clear state
+            if seen and (now - seen) <= self.timeout:
                 self.silent_since.pop(station, None)
-                self.alert_sent.discard(station)
+                clear_alert_state(station, "silence_down")
                 continue
 
+            # Start silence window (if not started yet)
             if station not in self.silent_since:
-                self.silent_since[station] = seen
+                # If we have never seen the station since service start, use "now" as best estimate
+                self.silent_since[station] = seen or now
+                continue
 
             silent_start = self.silent_since[station]
-            if (now - silent_start) > self.timeout:
-                if station not in self.alert_sent:
-                    last_seen_str = seen.strftime("%Y-%m-%d %H:%M:%S UTC") if seen else "unknown"
-                    logger.warning(
-                        f"{station} has had no MQTT messages for > {int(self.timeout.total_seconds()/60)} min "
-                        f"(last seen {last_seen_str})"
-                    )
-                    send_email(
-                        station=station,
-                        subject=f"Pi/camera offline alert: {station.upper()}",
-                        template_filename=TEMPLATE_PI_AND_CAMERA_DOWN,
-                        template_vars={
-                            "last_seen": last_seen_str,
-                            "minutes": str(int((now - seen).total_seconds() // 60)) if seen else "unknown",
-                            "time": last_seen_str,  # alias for older templates that used {time}
-                        },
-                    )
-                    self.alert_sent.add(station)
+
+            if (now - silent_start) <= self.timeout:
+                continue
+
+            action = should_send_alert_now(station, "silence_down", now)
+
+            if action == "auto_unsub":
+                mark_station_unsubscribed(station, reason="silence_down not resolved after repeats")
+                clear_alert_state(station, "silence_down")
+                self.silent_since.pop(station, None)
+                continue
+
+            if action == "skip":
+                continue
+
+            last_seen_str = seen.strftime("%Y-%m-%d %H:%M:%S UTC") if seen else "unknown"
+            minutes = str(int((now - seen).total_seconds() // 60)) if seen else "unknown"
+
+            logger.warning(
+                f"{station} has had no MQTT messages for > {int(self.timeout.total_seconds()/60)} min "
+                f"(last seen {last_seen_str})"
+            )
+            send_email(
+                station=station,
+                subject=f"Pi/camera offline alert: {station.upper()}",
+                template_filename=TEMPLATE_PI_AND_CAMERA_DOWN,
+                template_vars={
+                    "last_seen": last_seen_str,
+                    "minutes": minutes,
+                    "time": last_seen_str,  # alias for older templates that used {time}
+                },
+            )
+            record_alert_sent(station, "silence_down", now)
+
 
 
 class ScenarioHasntRebooted:
@@ -425,24 +605,24 @@ class ScenarioHasntRebooted:
     and the station's 'meteorcams/<station>/lastboot' timestamp is older than
     REBOOT_THRESHOLD_HOURS before now (UTC).
 
+    - Sends initial email once threshold exceeded
+    - If still stale, re-sends every REMINDER_INTERVAL_HOURS for up to REMINDER_MAX_REPEATS reminders
+    - After that, marks station unsubscribed in DB
+
     Uses TEMPLATE_HASNT_REBOOTED.
     """
     def __init__(self, threshold_hours: int):
         self.threshold = timedelta(hours=threshold_hours)
-        self.lastboot = {}         # station -> datetime (UTC) parsed from payload
-        self.alerted_for = {}      # station -> datetime lastboot value we already alerted on (prevents spam)
+        self.lastboot = {}  # station -> datetime (UTC) parsed from payload
 
     def _parse_lastboot_utc(self, s: str):
-        """
-        Parse lastboot string.
-        Expected: "YYYY-MM-DD HH:MM:SS" (UTC).
-        Also accepts ISO forms with T/Z.
-        """
+        """Parse lastboot string as UTC."""
         if not s:
             return None
-        s = s.strip()
+        s = str(s).strip()
+
+        # Common GMN/RMS format: "YYYY-MM-DD HH:MM:SS"
         try:
-            # "2025-12-27 17:01:01"
             dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
             return dt
         except Exception:
@@ -472,13 +652,9 @@ class ScenarioHasntRebooted:
         prev = self.lastboot.get(station)
         self.lastboot[station] = parsed
 
-        # If the station rebooted (lastboot moved forward), allow future alerts
-        if station in self.alerted_for:
-            if prev is None:
-                # don't know
-                pass
-            elif parsed > self.alerted_for[station]:
-                self.alerted_for.pop(station, None)
+        # If lastboot moved forward, the issue is likely resolved; reset reminder state
+        if prev and parsed > prev:
+            clear_alert_state(station, "hasnt_rebooted")
 
     def check_and_alert(self, now: datetime):
         watch = get_reboot_watch_stations()
@@ -491,17 +667,22 @@ class ScenarioHasntRebooted:
 
             age = now - lb
             if age <= self.threshold:
-                # Healthy: clear any alert lock if it exists
-                self.alerted_for.pop(station, None)
-                continue
-
-            # Only alert once per distinct "lastboot" value
-            already = self.alerted_for.get(station)
-            if already and already == lb:
+                clear_alert_state(station, "hasnt_rebooted")
                 continue
 
             hours = age.total_seconds() / 3600.0
             lb_str = lb.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            action = should_send_alert_now(station, "hasnt_rebooted", now)
+
+            if action == "auto_unsub":
+                mark_station_unsubscribed(station, reason="hasnt_rebooted not resolved after repeats")
+                clear_alert_state(station, "hasnt_rebooted")
+                continue
+
+            if action == "skip":
+                continue
+
             logger.warning(
                 f"{station} has not rebooted for {hours:.2f} hours (lastboot {lb_str})"
             )
@@ -514,7 +695,8 @@ class ScenarioHasntRebooted:
                     "hours": f"{hours:.2f}",
                 },
             )
-            self.alerted_for[station] = lb
+            record_alert_sent(station, "hasnt_rebooted", now)
+
 
 
 # ----------------------------
@@ -600,6 +782,9 @@ def main():
         f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} "
         f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT}"
     )
+
+    # Ensure DB schema exists (including alert reminder state)
+    ensure_alert_state_table()
 
     client = mqtt.Client()
 

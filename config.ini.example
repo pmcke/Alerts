@@ -8,9 +8,11 @@ password = YOUR MQTT BROKER PASSWORD
 # Existing
 timeout_minutes = 15
 check_interval_seconds = 60
-
 silence_timeout_minutes = 15
 reboot_threshold_hours = 30
+reminder_interval_hours = 24
+reminder_max_repeats = 3
+
 
 # enable/disable scenarios independently
 enable_camera_status_scenario = true
