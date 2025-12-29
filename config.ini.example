@@ -24,4 +24,15 @@ from_email = YOUR FROM EMAIL
 from_name = YOUR EMAIL NAME
 unsubscribe_url = YOUR UNSUBSCRIBE URL
 
+# -------------------------------------------------
+# Standardised app + paths used by unsubscribe_updated.py
+# -------------------------------------------------
+[app]
+public_base_url = YOUR URL
+
+[paths]
+db_path = YOUR PATH & DB NAME
+
+
+
 

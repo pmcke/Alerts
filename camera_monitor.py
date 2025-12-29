@@ -23,7 +23,7 @@ DB_PATH = os.path.join(BASE_DIR, "stations.db")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 
 # Templates:
-# Prefer /home/pmcke/Alerts/templates/<template>.txt but fallback to /home/pmcke/Alerts/<template>.txt
+# Prefer <working directory>/templates/<template>.txt but fallback to /<working directory>/<template>.txt
 TEMPLATE_DIR_PRIMARY = os.path.join(BASE_DIR, "templates")
 TEMPLATE_DIR_FALLBACK = BASE_DIR
 

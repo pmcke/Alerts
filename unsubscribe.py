@@ -4,11 +4,94 @@ import os
 import hmac
 import hashlib
 import html
+import configparser
+from pathlib import Path
 
 app = Flask(__name__)
 
-DB_PATH = "/home/pmcke/Alerts/stations.db"
-SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
+# -------------------------------------------------
+# Paths & config
+# -------------------------------------------------
+BASE_DIR = Path(__file__).resolve().parent
+
+# Where to read config from (override with env var if you want)
+CONFIG_PATH = Path(os.environ.get("UNSUBSCRIBE_CONFIG", str(BASE_DIR / "config.ini")))
+
+config = configparser.ConfigParser()
+config.read(CONFIG_PATH)
+
+# Standardised paths (can be overridden by env vars, then config.ini, then defaults)
+DB_PATH = os.environ.get(
+    "UNSUBSCRIBE_DB_PATH",
+    config.get("paths", "db_path", fallback=str(BASE_DIR / "stations.db")),
+)
+
+# Public base URL used in the "keep me subscribed" link
+PUBLIC_BASE_URL = os.environ.get(
+    "UNSUBSCRIBE_PUBLIC_BASE_URL",
+    config.get("app", "public_base_url", fallback=""),
+).rstrip("/")
+
+# Secret stays in environment by default (recommended). Optional fallback to config.ini.
+SECRET = os.environ.get(
+    "UNSUBSCRIBE_SECRET",
+    config.get("security", "unsubscribe_secret", fallback=""),
+)
+
+
+# -------------------------------------------------
+# Sanity checks (fail fast on misconfig)
+# -------------------------------------------------
+def sanity_check():
+    problems = []
+
+    if not CONFIG_PATH.exists():
+        problems.append(f"Config file not found: {CONFIG_PATH}")
+
+    if not PUBLIC_BASE_URL:
+        problems.append("public_base_url is not set (config [app] public_base_url or env UNSUBSCRIBE_PUBLIC_BASE_URL)")
+
+    if not SECRET:
+        problems.append("UNSUBSCRIBE_SECRET not set (env UNSUBSCRIBE_SECRET or config [security] unsubscribe_secret)")
+
+    if not DB_PATH:
+        problems.append("db_path is empty (config [paths] db_path or env UNSUBSCRIBE_DB_PATH)")
+    elif not Path(DB_PATH).exists():
+        problems.append(f"Database not found: {DB_PATH}")
+
+    # DB structure check (only if the file exists)
+    if DB_PATH and Path(DB_PATH).exists():
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='stations'"
+            )
+            if not cur.fetchone():
+                problems.append("Database is missing required table: stations")
+
+            # Optional: verify required columns exist
+            cur.execute("PRAGMA table_info(stations)")
+            cols = {row[1] for row in cur.fetchall()}  # row[1] = column name
+            required = {"station", "email", "unsubscribed"}
+            missing = required - cols
+            if missing:
+                problems.append(f"Database table 'stations' missing columns: {', '.join(sorted(missing))}")
+            conn.close()
+        except Exception as e:
+            problems.append(f"Database check failed: {e!r}")
+
+    if problems:
+        msg = "Unsubscribe service configuration errors:\n- " + "\n- ".join(problems)
+        raise RuntimeError(msg)
+
+    # Helpful startup info (no secrets)
+    print(f"[unsubscribe] CONFIG_PATH={CONFIG_PATH}")
+    print(f"[unsubscribe] DB_PATH={DB_PATH}")
+    print(f"[unsubscribe] PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
+
+
+sanity_check()
 
 
 # -------------------------------------------------
@@ -101,7 +184,7 @@ def unsubscribe_confirm():
         <button type="submit">Yes, unsubscribe</button>
     </form>
 
-    <p><a href="https://alerts.mckellar.nz/">No, keep me subscribed</a></p>
+    <p><a href="{PUBLIC_BASE_URL}/">No, keep me subscribed</a></p>
     """
 
 
