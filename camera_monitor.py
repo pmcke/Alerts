@@ -91,6 +91,13 @@ FROM_EMAIL = config.get("mailjet", "from_email", fallback="")
 FROM_NAME = config.get("mailjet", "from_name", fallback="Meteor Camera Alerts")
 UNSUB_BASE_URL = config.get("mailjet", "unsubscribe_url", fallback="").strip()
 
+# Mailjet BCC (optional)
+MAILJET_BCC = [
+    e.strip()
+    for e in config.get("mailjet", "bcc_emails", fallback="").split(",")
+    if e.strip()
+]
+
 # Unsubscribe signing secret (must match what unsubscribe.py expects)
 UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "").strip()
 

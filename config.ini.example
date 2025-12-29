@@ -24,6 +24,10 @@ api_key = YOUR API KEY
 api_secret = YOUR API SECRET
 from_email = YOUR FROM EMAIL
 from_name = YOUR EMAIL NAME
+
+# Optional: comma-separated list
+bcc_emails = YOUR BCC EMAIL
+
 unsubscribe_url = YOUR UNSUBSCRIBE URL
 
 # -------------------------------------------------
