@@ -1,1 +1,2 @@
-Under Development. Do not use yet
+See System documentation in PDF file 
+Meteor_Camera_Alerting_System_Documentation_v2.pdf
