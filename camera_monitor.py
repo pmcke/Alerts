@@ -119,6 +119,30 @@ MAILJET_BCC = [
     e.strip() for e in config.get("mailjet", "bcc_emails", fallback="").split(",") if e.strip()
 ]
 
+# Support contacts shown inside email templates (comma-separated)
+SUPPORT_EMAILS = [
+    e.strip()
+    for e in config.get("mailjet", "support_emails", fallback="").split(",")
+    if e.strip()
+]
+
+def build_support_contacts_html(emails):
+    """
+    Returns HTML like:
+      Name (<a href="mailto:x@y">x@y</a>) or ...
+    Currently shows email only; names can be added later.
+    """
+    if not emails:
+        return ""
+
+    lines = []
+    for e in emails:
+        esc = htmlmod.escape(e)
+        lines.append(f'{esc} (<a href="mailto:{esc}">{esc}</a>)')
+
+    return "<br>".join(lines)
+
+
 # Secret used to HMAC-sign unsubscribe links (recommended in env var)
 UNSUBSCRIBE_SECRET = os.environ.get("UNSUBSCRIBE_SECRET", "")
 
@@ -441,7 +465,10 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
     merged.setdefault("station", htmlmod.escape(station_upper))
     merged.setdefault("unsubscribe_link", htmlmod.escape(unsub_link) if unsub_link else "")
     merged.setdefault("unsubscribe_url", htmlmod.escape(unsub_link) if unsub_link else "")
+    merged.setdefault("support_contacts",build_support_contacts_html(SUPPORT_EMAILS)
+    )
 
+ 
     try:
         body_html = tpl.format(**merged)
     except Exception:

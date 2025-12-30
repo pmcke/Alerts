@@ -24,6 +24,8 @@ api_key = YOUR API KEY
 api_secret = YOUR API SECRET
 from_email = YOUR FROM EMAIL
 from_name = YOUR EMAIL NAME
+support_emails = YOUR SUPPORT EMAIL ADDRESSES Comma separated
+
 
 # Optional: comma-separated list
 bcc_emails = YOUR BCC EMAIL
