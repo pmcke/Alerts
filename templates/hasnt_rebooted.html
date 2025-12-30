@@ -1,0 +1,25 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reboot failure alert</title>
+</head>
+<body style="margin:0; padding:0; background:#ffffff;">
+  <div style="max-width:680px; margin:0 auto; padding:24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:1.5; color:#111;">
+    <pre style="white-space:pre-wrap; margin:0; font-family:inherit;">Station {station} has not rebooted recently.
+
+Last boot (UTC): {lastboot}
+Hours since boot: {hours}
+
+Suggested fix:
+1) Check power/network
+2) SSH into the Pi and reboot:
+   sudo reboot
+3) If it returns, check camera service logs.
+
+Unsubscribe:
+<a href="{unsubscribe_link}">{unsubscribe_link}</a></pre>
+  </div>
+</body>
+</html>
