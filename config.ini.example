@@ -39,6 +39,9 @@ public_base_url = YOUR URL
 [paths]
 db_path = YOUR PATH & DB NAME
 
+[logging]
+level = INFO
+# Valid values: DEBUG INFO(Recommended) WARNING ERROR CRITICAL
 
 
 

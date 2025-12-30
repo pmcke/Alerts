@@ -50,12 +50,41 @@ if not read_ok:
     logger.error(f"Could not read config file: {CONFIG_FILE}")
     sys.exit(1)
 
+# ----------------------------
+# Apply logging level from config.ini (after config is loaded)
+# ----------------------------
+LOG_LEVEL_STR = config.get("logging", "level", fallback="INFO").upper().strip()
+LOG_LEVEL_MAP = {
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+LOG_LEVEL = LOG_LEVEL_MAP.get(LOG_LEVEL_STR, logging.INFO)
+
+# Update root logger + any existing handlers (journald)
+root_logger = logging.getLogger()
+root_logger.setLevel(LOG_LEVEL)
+for h in root_logger.handlers:
+    try:
+        h.setLevel(LOG_LEVEL)
+    except Exception:
+        pass
+
+logger.setLevel(LOG_LEVEL)
+logger.info(f"Logging level set to {LOG_LEVEL_STR}")
+
 # MQTT
 MQTT_HOST = config.get("mqtt", "host", fallback="")
 MQTT_PORT = config.getint("mqtt", "port", fallback=8883)
 MQTT_USER = config.get("mqtt", "username", fallback="")
 MQTT_PASS = config.get("mqtt", "password", fallback="")
 MQTT_TOPIC = config.get("mqtt", "topic", fallback="meteorcams/#")
+
+MQTT_TLS = config.getboolean("mqtt", "tls", fallback=(MQTT_PORT == 8883))
+# Optional: allow insecure TLS (NOT recommended) if you are debugging cert issues
+MQTT_TLS_INSECURE = config.getboolean("mqtt", "tls_insecure", fallback=False)
 
 # Monitor
 CHECK_INTERVAL = config.getint("monitor", "check_interval_seconds", fallback=60)
@@ -638,10 +667,18 @@ def on_connect(client, userdata, flags, rc):
         logger.error(f"MQTT connection failed rc={rc}")
 
 
+
+def on_disconnect(client, userdata, rc):
+    # rc == 0 means clean disconnect
+    logger.warning(f"MQTT disconnected rc={rc}")
+
+
 def on_message(client, userdata, msg):
     try:
         topic = (msg.topic or "").strip()
         payload = msg.payload.decode("utf-8", errors="ignore").strip()
+
+        logger.debug("MQTT RX topic=%s payload=%s", topic, payload[:200])
 
         parts = topic.split("/")
         if len(parts) < 3:
@@ -707,11 +744,28 @@ def main():
 
     client = mqtt.Client()
 
+    # Route paho-mqtt internal logging through our logger (respects config.ini log level)
+    client.enable_logger(logger)
+
+    # TLS: HiveMQ Cloud on port 8883 requires TLS
+    if MQTT_TLS:
+        try:
+            client.tls_set()  # uses system CA certs
+            client.tls_insecure_set(MQTT_TLS_INSECURE)
+            logger.info(f"MQTT TLS enabled (insecure={MQTT_TLS_INSECURE})")
+        except Exception:
+            logger.exception("Failed to configure MQTT TLS")
+            raise
+
+
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
 
     client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
     client.on_message = on_message
+
+    logger.info(f"Connecting to MQTT host={MQTT_HOST} port={MQTT_PORT} topic={MQTT_TOPIC}")
 
     try:
         client.connect(MQTT_HOST, MQTT_PORT, 60)
