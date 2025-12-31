@@ -581,8 +581,14 @@ class ScenarioPiAndCameraDown:
             if action == "skip":
                 continue
 
-            last_seen_str = seen.strftime("%Y-%m-%d %H:%M:%S UTC") if seen else "unknown"
-            minutes = str(int((now - seen).total_seconds() // 60)) if seen else "unknown"
+            # Use the best-known "since" time:
+            # - if we have an actual MQTT last_seen, use it
+            # - otherwise fall back to when we first noticed silence (silent_start)
+            since_dt = seen or silent_start
+
+            last_seen_str = since_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            minutes = str(int((now - since_dt).total_seconds() // 60))
+
 
             send_email(
                 station=station,
