@@ -147,7 +147,12 @@ def unsubscribe_confirm():
     sig = (request.args.get("sig") or "").strip()
 
     if not station or not email or not sig:
-        abort(400)
+        return """
+        <h2>Unsubscribe link required</h2>
+        <p>This page must be opened using the unsubscribe link from an alert email.</p>
+        <p>If you need help, contact the support team.</p>
+        """, 200
+
 
     station_upper = station.upper()
     station_db = station_upper.lower()
