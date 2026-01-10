@@ -7,14 +7,29 @@
 </head>
 <body style="margin:0; padding:0; background:#ffffff;">
   <div style="max-width:680px; margin:0 auto; padding:24px; font-family:Arial, Helvetica, sans-serif; font-size:14px; line-height:1.5; color:#111;">
+   <!-- Header with logo and title -->
+<div style="margin-bottom:20px; overflow:hidden;">
+  <img src="https://fireballs.nz/wp-content/uploads/2023/12/Fireballs-circle.png"
+       alt="Fireballs NZ"
+       width="90"
+       style="float:left; margin:0 14px 8px 0; border:0; outline:none; text-decoration:none;">
+
+  <div style="font-size:18px; font-weight:bold; line-height:1.2; margin-top:12px;">
+    Fireballs NZ – Camera Alerts
+  </div>
+</div>
+
+
+
     <pre style="white-space:pre-wrap; margin:0; font-family:inherit;">Station {station} has not rebooted recently.
+      
 
 
 Don't reply to this email
 
 Your station last booted at (UTC): {lastboot}
 Hours since boot: {hours}
-
+<div style="clear:both;"></div>
 There may not be anything wrong. It may only be confused.
 
 1) Log into your pi/computer. Look in the RMS_Data folder. Look for a file called ".reboot_lock". You may need 
