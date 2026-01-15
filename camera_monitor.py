@@ -91,7 +91,7 @@ CHECK_INTERVAL = config.getint("monitor", "check_interval_seconds", fallback=60)
 TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 
 # Optional: separate "silence" timeout (no MQTT messages at all)
-SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=TIMEOUT_MINUTES)
+SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=25)
 
 # Scenario C: "hasn't rebooted"
 REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
