@@ -12,6 +12,7 @@ silence_timeout_minutes = 15
 reboot_threshold_hours = 30
 reminder_interval_hours = 24
 reminder_max_repeats = 3
+global_outage_minutes = 10
 
 
 # enable/disable scenarios independently
