@@ -92,10 +92,10 @@ TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 
 # Optional: separate "silence" timeout (no MQTT messages at all)
 SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=25)
+
 # If NOTHING arrives from MQTT at all for this long, treat it as a local/server outage
 # and suppress Scenario PiAndCameraDown emails (prevents “email burst” when MQTT returns).
 GLOBAL_OUTAGE_MINUTES = config.getint("monitor", "global_outage_minutes", fallback=10)
-
 
 # Scenario C: "hasn't rebooted"
 REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
@@ -133,7 +133,7 @@ SUPPORT_EMAILS = [
 def build_support_contacts_html(emails):
     """
     Returns HTML like:
-      Name (<a href="mailto:x@y">x@y</a>) or ...
+      x@y (<a href="mailto:x@y">x@y</a>)<br>...
     Currently shows email only; names can be added later.
     """
     if not emails:
@@ -162,6 +162,8 @@ if not FROM_EMAIL:
     logger.warning("Missing Mailjet from_email (emails will fail)")
 if not UNSUB_BASE_URL:
     logger.warning("Missing mailjet.unsubscribe_url in config.ini (unsubscribe links will be omitted)")
+if not SUPPORT_EMAILS:
+    logger.warning("No mailjet.support_emails configured (support_contacts placeholder will be empty)")
 if not UNSUBSCRIBE_SECRET:
     logger.warning("UNSUBSCRIBE_SECRET env var not set (signed unsubscribe links will be omitted)")
 
@@ -268,7 +270,7 @@ def ensure_alert_state_table():
         """
     )
     conn.commit()
-    conn.close()n
+    conn.close()
 
 
 def clear_alert_state(station: str, scenario: str):
@@ -471,10 +473,8 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
     merged.setdefault("station", htmlmod.escape(station_upper))
     merged.setdefault("unsubscribe_link", htmlmod.escape(unsub_link) if unsub_link else "")
     merged.setdefault("unsubscribe_url", htmlmod.escape(unsub_link) if unsub_link else "")
-    merged.setdefault("support_contacts",build_support_contacts_html(SUPPORT_EMAILS)
-    )
+    merged.setdefault("support_contacts", build_support_contacts_html(SUPPORT_EMAILS))
 
- 
     try:
         body_html = tpl.format(**merged)
     except Exception:
@@ -560,26 +560,25 @@ class ScenarioPiAndCameraDown:
         active = get_active_stations()
 
         # -------- Global outage suppression --------
-        # If we have received NO MQTT messages from ANY station recently, treat it as
-        # a local/server/broker outage and suppress PiAndCameraDown emails.
-        # Also clear timers/state so we don't "queue up" a burst of emails when MQTT resumes.
         outage_threshold = timedelta(minutes=GLOBAL_OUTAGE_MINUTES)
 
-        if (last_any_mqtt is None) or ((now - last_any_mqtt) > outage_threshold):
-            if last_any_mqtt is None:
-                logger.warning(
-                    f"Global MQTT silence: no messages received yet. "
-                    f"Suppressing PiAndCameraDown alerts."
-                )
-            else:
-                mins = (now - last_any_mqtt).total_seconds() / 60.0
-                logger.warning(
-                    f"Global MQTT silence: no messages for {mins:.1f} minutes "
-                    f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
-                    f"Suppressing PiAndCameraDown alerts and clearing silence timers."
-                )
+        # On startup (last_any_mqtt is None), suppress but DO NOT clear DB state.
+        if last_any_mqtt is None:
+            logger.warning(
+                "Global MQTT silence: no messages received yet (startup). "
+                "Suppressing PiAndCameraDown only."
+            )
+            self.silent_since.clear()  # in-memory only
+            return
 
-            # Clear per-station silence timers and alert_state to avoid bursts later
+        # After startup, treat extended silence as local/server outage and clear state to avoid bursts
+        if (now - last_any_mqtt) > outage_threshold:
+            mins = (now - last_any_mqtt).total_seconds() / 60.0
+            logger.warning(
+                f"Global MQTT silence: no messages for {mins:.1f} minutes "
+                f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
+                "Suppressing PiAndCameraDown and clearing silence state."
+            )
             self.silent_since.clear()
             for station in active:
                 clear_alert_state(station, "silence_down")
@@ -630,6 +629,7 @@ class ScenarioPiAndCameraDown:
             )
             record_alert_sent(station, "silence_down", now)
 
+
 class ScenarioHasntRebooted:
     def __init__(self, threshold_hours: int):
         self.threshold = timedelta(hours=threshold_hours)
@@ -674,11 +674,8 @@ class ScenarioHasntRebooted:
 
     def check_and_alert(self, now: datetime):
         if (last_any_mqtt is None) or ((now - last_any_mqtt) > timedelta(minutes=GLOBAL_OUTAGE_MINUTES)):
-            logger.warning(
-                "Global MQTT silence — suppressing HasntRebooted checks"
-        )
-        return
-
+            logger.warning("Global MQTT silence — suppressing HasntRebooted checks")
+            return
 
         watch = get_reboot_watch_stations()
 
@@ -732,7 +729,6 @@ def on_connect(client, userdata, flags, rc):
         logger.info(f"Subscribed to {MQTT_TOPIC}")
     else:
         logger.error(f"MQTT connection failed rc={rc}")
-
 
 
 def on_disconnect(client, userdata, rc):
@@ -796,9 +792,18 @@ def monitor_loop():
 # Main
 # ----------------------------
 def main():
+    # --- Hardening / debug: log resolved paths ---
+    logger.info(f"BASE_DIR={BASE_DIR}")
+    logger.info(f"CONFIG_FILE={CONFIG_FILE}")
+    logger.info(f"DB_PATH={DB_PATH}")
+    logger.info(f"TEMPLATE_DIR_PRIMARY={TEMPLATE_DIR_PRIMARY}")
+    logger.info(f"TEMPLATE_DIR_FALLBACK={TEMPLATE_DIR_FALLBACK}")
+    # --------------------------------------------
+
     logger.info(
         f"Timeout minutes={TIMEOUT_MINUTES}, silence timeout minutes={SILENCE_TIMEOUT_MINUTES}, "
-        f"reboot threshold hours={REBOOT_THRESHOLD_HOURS}, check interval seconds={CHECK_INTERVAL}"
+        f"global outage minutes={GLOBAL_OUTAGE_MINUTES}, reboot threshold hours={REBOOT_THRESHOLD_HOURS}, "
+        f"check interval seconds={CHECK_INTERVAL}"
     )
     logger.info(
         f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} "
@@ -826,7 +831,6 @@ def main():
         except Exception:
             logger.exception("Failed to configure MQTT TLS")
             raise
-
 
     if MQTT_USER:
         client.username_pw_set(MQTT_USER, MQTT_PASS)
