@@ -92,6 +92,10 @@ TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 
 # Optional: separate "silence" timeout (no MQTT messages at all)
 SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=25)
+# If NOTHING arrives from MQTT at all for this long, treat it as a local/server outage
+# and suppress Scenario PiAndCameraDown emails (prevents “email burst” when MQTT returns).
+GLOBAL_OUTAGE_MINUTES = config.getint("monitor", "global_outage_minutes", fallback=10)
+
 
 # Scenario C: "hasn't rebooted"
 REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
@@ -169,7 +173,9 @@ mailjet = Client(auth=(MAILJET_API_KEY, MAILJET_SECRET), version="v3.1")
 # ----------------------------
 # Shared state
 # ----------------------------
-last_seen = {}  # station -> datetime (UTC), updated on ANY received MQTT message
+last_seen = {}        # station -> datetime (UTC), updated on ANY received MQTT message
+last_any_mqtt = None  # datetime (UTC) of last MQTT message from ANY station
+
 
 # ----------------------------
 # Database helpers
@@ -262,7 +268,7 @@ def ensure_alert_state_table():
         """
     )
     conn.commit()
-    conn.close()
+    conn.close()n
 
 
 def clear_alert_state(station: str, scenario: str):
@@ -553,6 +559,33 @@ class ScenarioPiAndCameraDown:
     def check_and_alert(self, now: datetime):
         active = get_active_stations()
 
+        # -------- Global outage suppression --------
+        # If we have received NO MQTT messages from ANY station recently, treat it as
+        # a local/server/broker outage and suppress PiAndCameraDown emails.
+        # Also clear timers/state so we don't "queue up" a burst of emails when MQTT resumes.
+        outage_threshold = timedelta(minutes=GLOBAL_OUTAGE_MINUTES)
+
+        if (last_any_mqtt is None) or ((now - last_any_mqtt) > outage_threshold):
+            if last_any_mqtt is None:
+                logger.warning(
+                    f"Global MQTT silence: no messages received yet. "
+                    f"Suppressing PiAndCameraDown alerts."
+                )
+            else:
+                mins = (now - last_any_mqtt).total_seconds() / 60.0
+                logger.warning(
+                    f"Global MQTT silence: no messages for {mins:.1f} minutes "
+                    f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
+                    f"Suppressing PiAndCameraDown alerts and clearing silence timers."
+                )
+
+            # Clear per-station silence timers and alert_state to avoid bursts later
+            self.silent_since.clear()
+            for station in active:
+                clear_alert_state(station, "silence_down")
+            return
+        # ------------------------------------------
+
         for station in active:
             seen = last_seen.get(station)
 
@@ -581,14 +614,9 @@ class ScenarioPiAndCameraDown:
             if action == "skip":
                 continue
 
-            # Use the best-known "since" time:
-            # - if we have an actual MQTT last_seen, use it
-            # - otherwise fall back to when we first noticed silence (silent_start)
             since_dt = seen or silent_start
-
             last_seen_str = since_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
             minutes = str(int((now - since_dt).total_seconds() // 60))
-
 
             send_email(
                 station=station,
@@ -601,7 +629,6 @@ class ScenarioPiAndCameraDown:
                 },
             )
             record_alert_sent(station, "silence_down", now)
-
 
 class ScenarioHasntRebooted:
     def __init__(self, threshold_hours: int):
@@ -646,6 +673,13 @@ class ScenarioHasntRebooted:
             clear_alert_state(station, "hasnt_rebooted")
 
     def check_and_alert(self, now: datetime):
+        if (last_any_mqtt is None) or ((now - last_any_mqtt) > timedelta(minutes=GLOBAL_OUTAGE_MINUTES)):
+            logger.warning(
+                "Global MQTT silence — suppressing HasntRebooted checks"
+        )
+        return
+
+
         watch = get_reboot_watch_stations()
 
         for station in watch:
@@ -723,6 +757,9 @@ def on_message(client, userdata, msg):
         station = (parts[1] or "").strip().lower()
         metric = (parts[2] or "").strip().lower()
         now = datetime.now(timezone.utc)
+
+        global last_any_mqtt
+        last_any_mqtt = now
 
         last_seen[station] = now
 
