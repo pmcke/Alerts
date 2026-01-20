@@ -32,11 +32,48 @@ PUBLIC_BASE_URL = os.environ.get(
     config.get("app", "public_base_url", fallback=""),
 ).rstrip("/")
 
-# Secret stays in environment by default (recommended). Optional fallback to config.ini.
-SECRET = os.environ.get(
-    "UNSUBSCRIBE_SECRET",
-    config.get("security", "unsubscribe_secret", fallback=""),
-)
+
+# -------------------------------------------------
+# Secrets (supports rotation / multiple secrets)
+# -------------------------------------------------
+def _split_secrets(val: str) -> list[str]:
+    """Split comma-separated secrets, trim whitespace, drop empties."""
+    if not val:
+        return []
+    return [p.strip() for p in val.split(",") if p.strip()]
+
+
+def _get_secrets() -> list[str]:
+    """
+    Return list of acceptable secrets.
+
+    Supported sources (in order, all combined):
+      - env: UNSUBSCRIBE_SECRET
+      - env: UNSUBSCRIBE_SECRET_OLD
+      - config: [security] unsubscribe_secret
+      - config: [security] unsubscribe_secret_old
+
+    Each value may be a single secret or a comma-separated list.
+    Duplicates are removed while preserving order.
+    """
+    candidates: list[str] = []
+
+    # Environment (preferred)
+    candidates += _split_secrets((os.environ.get("UNSUBSCRIBE_SECRET") or "").strip())
+    candidates += _split_secrets((os.environ.get("UNSUBSCRIBE_SECRET_OLD") or "").strip())
+
+    # Config fallback (optional)
+    candidates += _split_secrets((config.get("security", "unsubscribe_secret", fallback="") or "").strip())
+    candidates += _split_secrets((config.get("security", "unsubscribe_secret_old", fallback="") or "").strip())
+
+    # De-dup while preserving order
+    seen = set()
+    out: list[str] = []
+    for s in candidates:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 # -------------------------------------------------
@@ -51,8 +88,13 @@ def sanity_check():
     if not PUBLIC_BASE_URL:
         problems.append("public_base_url is not set (config [app] public_base_url or env UNSUBSCRIBE_PUBLIC_BASE_URL)")
 
-    if not SECRET:
-        problems.append("UNSUBSCRIBE_SECRET not set (env UNSUBSCRIBE_SECRET or config [security] unsubscribe_secret)")
+    secrets = _get_secrets()
+    if not secrets:
+        problems.append(
+            "No unsubscribe secret configured. Set env UNSUBSCRIBE_SECRET "
+            "(optionally UNSUBSCRIBE_SECRET_OLD), or config [security] unsubscribe_secret "
+            "(optionally unsubscribe_secret_old)."
+        )
 
     if not DB_PATH:
         problems.append("db_path is empty (config [paths] db_path or env UNSUBSCRIBE_DB_PATH)")
@@ -64,9 +106,7 @@ def sanity_check():
         try:
             conn = sqlite3.connect(DB_PATH)
             cur = conn.cursor()
-            cur.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='stations'"
-            )
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='stations'")
             if not cur.fetchone():
                 problems.append("Database is missing required table: stations")
 
@@ -89,6 +129,7 @@ def sanity_check():
     print(f"[unsubscribe] CONFIG_PATH={CONFIG_PATH}")
     print(f"[unsubscribe] DB_PATH={DB_PATH}")
     print(f"[unsubscribe] PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
+    print(f"[unsubscribe] SECRETS_CONFIGURED={len(_get_secrets())} (values hidden)")
 
 
 sanity_check()
@@ -96,19 +137,31 @@ sanity_check()
 
 # -------------------------------------------------
 # HMAC signing (USES UPPERCASE STATION)
+# NOTE: make_sig() uses the *first* configured secret.
+#       verify_sig() accepts any configured secret (rotation).
 # -------------------------------------------------
 def make_sig(station_upper: str, email: str) -> str:
-    if not SECRET:
-        raise RuntimeError("UNSUBSCRIBE_SECRET not set")
+    secrets = _get_secrets()
+    if not secrets:
+        raise RuntimeError("No unsubscribe secret configured")
+    secret = secrets[0]
     msg = f"{station_upper}|{email}".encode("utf-8")
-    return hmac.new(SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
 def verify_sig(station_upper: str, email: str, sig: str) -> bool:
-    if not SECRET:
+    sig = (sig or "").strip().lower()
+    if not sig:
         return False
-    expected = make_sig(station_upper, email)
-    return hmac.compare_digest(expected, sig or "")
+
+    msg = f"{station_upper}|{email}".encode("utf-8")
+
+    for secret in _get_secrets():
+        expected = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+        if hmac.compare_digest(expected, sig):
+            return True
+
+    return False
 
 
 # -------------------------------------------------
@@ -152,7 +205,6 @@ def unsubscribe_confirm():
         <p>This page must be opened using the unsubscribe link from an alert email.</p>
         <p>If you need help, contact the support team.</p>
         """, 200
-
 
     station_upper = station.upper()
     station_db = station_upper.lower()
