@@ -1,0 +1,3 @@
+Flask>=2.2
+paho-mqtt>=1.6
+mailjet-rest>=1.3.4
