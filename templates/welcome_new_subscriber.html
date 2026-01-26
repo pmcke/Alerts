@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Welcome to Camera Alerts</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+  </head>
+  <body
+    style="
+      margin: 0;
+      padding: 0;
+      background: #f6f6f6;
+      font-family: Arial, Helvetica, sans-serif;
+    "
+  >
+    <div style="max-width: 720px; margin: 0 auto; padding: 18px">
+      <div
+        style="
+          background: #ffffff;
+          border: 1px solid #e5e5e5;
+          border-radius: 10px;
+          padding: 18px;
+        "
+      >
+        <h2 style="margin: 0 0 10px 0">Welcome to Camera Alerts</h2>
+
+        <p style="margin: 0 0 12px 0">
+          Thanks for subscribing. This message is also a delivery test to help
+          confirm emails are arriving (and not going to spam).
+        </p>
+
+        <div
+          style="
+            background: #fafafa;
+            border: 1px solid #eeeeee;
+            border-radius: 8px;
+            padding: 12px;
+            margin: 0 0 14px 0;
+          "
+        >
+          <p style="margin: 0">
+            <strong>Station:</strong> {station}<br />
+            <strong>Email:</strong> {email}<br />
+            <strong>Sent (UTC):</strong> {sent_utc}
+          </p>
+        </div>
+
+        <h3 style="margin: 16px 0 8px 0">What to expect</h3>
+        <ul style="margin: 0 0 12px 20px; padding: 0">
+          <li>
+            You’ll receive alerts if the camera (or associated system) looks
+            offline.
+          </li>
+          <li>
+            If you ever want to stop alerts, use the unsubscribe link below.
+          </li>
+          <li>
+            To improve deliverability, consider adding the sender to your
+            contacts.
+          </li>
+        </ul>
+
+        <h3 style="margin: 16px 0 8px 0">Quick checks (deliverability)</h3>
+        <ul style="margin: 0 0 12px 20px; padding: 0">
+          <li>
+            Check your spam/junk folder and mark this email as “Not spam” if
+            needed.
+          </li>
+          <li>
+            If your mail provider supports it, move this message to your inbox.
+          </li>
+          <li>Some providers also have a “Safe sender” / “Allow list”.</li>
+        </ul>
+
+        <hr
+          style="border: none; border-top: 1px solid #eeeeee; margin: 16px 0"
+        />
+
+        <p style="margin: 0 0 8px 0">
+          <strong>Support</strong><br />
+          {support_contacts}
+        </p>
+
+        <p style="margin: 10px 0 0 0; font-size: 13px; color: #666">
+          Unsubscribe:
+          <a href="{unsubscribe_link}">{unsubscribe_link}</a>
+        </p>
+
+        <p style="margin: 12px 0 0 0; font-size: 12px; color: #888">
+          Please don’t reply to this automated email.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>
