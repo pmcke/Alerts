@@ -62,14 +62,6 @@ def main():
             f"Create it in: {os.path.join(base_dir, 'templates', template_filename)}"
         )
 
-    # Build unsubscribe link (will be empty if unsubscribe_url or UNSUBSCRIBE_SECRET missing)
-    unsub_link = ""
-    try:
-        unsub_link = cm.build_unsubscribe_link(getattr(cm, "UNSUB_BASE_URL", ""), station_upper, email_in)
-    except Exception:
-        # Keep going; welcome email should still send
-        unsub_link = ""
-
     # Support contacts HTML (from config.ini)
     try:
         support_html = cm.build_support_contacts_html(getattr(cm, "SUPPORT_EMAILS", []))
@@ -80,13 +72,11 @@ def main():
 
     # Merge template vars (escape anything user-controlled)
     merged = {
-        "station": html.escape(station_upper),
-        "station_lower": html.escape(station_lower),
-        "email": html.escape(email_in),
-        "sent_utc": html.escape(now_utc),
-        "unsubscribe_link": html.escape(unsub_link) if unsub_link else "",
-        "unsubscribe_url": html.escape(unsub_link) if unsub_link else "",
-        "support_contacts": support_html or "",
+    "station": html.escape(station_upper),
+    "station_lower": html.escape(station_lower),
+    "email": html.escape(email_in),
+    "sent_utc": html.escape(now_utc),
+    "support_contacts": support_html or "",
     }
 
     try:
