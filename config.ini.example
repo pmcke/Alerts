@@ -19,6 +19,7 @@ global_outage_minutes = 10
 enable_camera_status_scenario = true
 enable_silence_scenario = true
 enable_reboot_scenario = true
+enable_lux_scenario = true
 
 [mailjet]
 api_key = YOUR API KEY

@@ -40,6 +40,7 @@ TEMPLATE_DIR_FALLBACK = "/etc/camera-monitor/templates"
 TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.html"
 TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.html"
 TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.html"
+TEMPLATE_LUXMETER_DOWN = "luxmeterdown.html"
 
 # ----------------------------
 # Load config
@@ -108,6 +109,7 @@ REMINDER_MAX_REPEATS = config.getint("monitor", "reminder_max_repeats", fallback
 ENABLE_SCENARIO_CAMERA_STATUS = config.getboolean("monitor", "enable_camera_status_scenario", fallback=True)
 ENABLE_SCENARIO_SILENCE = config.getboolean("monitor", "enable_silence_scenario", fallback=True)
 ENABLE_SCENARIO_REBOOT = config.getboolean("monitor", "enable_reboot_scenario", fallback=True)
+ENABLE_SCENARIO_LUX = config.getboolean("monitor", "enable_lux_scenario", fallback=True)
 
 # Mailjet
 MAILJET_API_KEY = config.get("mailjet", "api_key", fallback="")
@@ -129,6 +131,7 @@ SUPPORT_EMAILS = [
     for e in config.get("mailjet", "support_emails", fallback="").split(",")
     if e.strip()
 ]
+
 
 def build_support_contacts_html(emails):
     """
@@ -242,6 +245,27 @@ def get_reboot_watch_stations():
         SELECT station
         FROM stations
         WHERE COALESCE(reboot, 0) = 1
+          AND COALESCE(unsubscribed, 0) = 0
+        """
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [str(r[0]).strip().lower() for r in rows if r and r[0]]
+
+
+def get_lux_watch_stations():
+    """
+    Return list of stations (lowercase) that should be checked for luxmeter issues:
+    - lux = 1
+    - unsubscribed = 0
+    """
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT station
+        FROM stations
+        WHERE COALESCE(lux, 0) = 1
           AND COALESCE(unsubscribed, 0) = 0
         """
     )
@@ -714,12 +738,69 @@ class ScenarioHasntRebooted:
             record_alert_sent(station, "hasnt_rebooted", now)
 
 
+class ScenarioLuxmeterDown:
+    """
+    Scenario D:
+      - Listens for metric 'luxmeterstatus'
+      - If payload == '0' -> luxmeter down (track first down time)
+      - If payload == '1' -> recovered (clear state)
+      - ONLY applies to stations where stations.lux = 1 and unsubscribed = 0
+      - Uses the shared reminder/escalation logic via alert_state and should_send_alert_now()
+    """
+    def __init__(self):
+        self.down_since = {}  # station -> datetime when luxmeterstatus first became 0
+
+    def handle_mqtt(self, station: str, metric: str, payload: str, now: datetime):
+        if metric != "luxmeterstatus":
+            return
+
+        if payload == "0":
+            if station not in self.down_since:
+                self.down_since[station] = now
+                logger.warning(f"{station} luxmeterstatus=0 (first seen at {now.isoformat()})")
+
+        elif payload == "1":
+            self.down_since.pop(station, None)
+            clear_alert_state(station, "luxmeter_down")
+
+    def check_and_alert(self, now: datetime):
+        watch = get_lux_watch_stations()
+
+        for station in watch:
+            since = self.down_since.get(station)
+            if not since:
+                continue
+
+            action = should_send_alert_now(station, "luxmeter_down", now)
+
+            if action == "auto_unsub":
+                mark_station_unsubscribed(station, reason="luxmeter_down not resolved after repeats")
+                clear_alert_state(station, "luxmeter_down")
+                self.down_since.pop(station, None)
+                continue
+
+            if action == "skip":
+                continue
+
+            time_str = since.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+            send_email(
+                station=station,
+                subject=f"Luxmeter offline alert: {station.upper()}",
+                template_filename=TEMPLATE_LUXMETER_DOWN,
+                template_vars={"time": time_str},
+            )
+
+            record_alert_sent(station, "luxmeter_down", now)
+
+
 # ----------------------------
 # MQTT callbacks
 # ----------------------------
 scenario_a = ScenarioCameraStatusDown(timeout_minutes=TIMEOUT_MINUTES) if ENABLE_SCENARIO_CAMERA_STATUS else None
 scenario_b = ScenarioPiAndCameraDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if ENABLE_SCENARIO_SILENCE else None
 scenario_c = ScenarioHasntRebooted(threshold_hours=REBOOT_THRESHOLD_HOURS) if ENABLE_SCENARIO_REBOOT else None
+scenario_d = ScenarioLuxmeterDown() if ENABLE_SCENARIO_LUX else None
 
 
 def on_connect(client, userdata, flags, rc):
@@ -765,6 +846,9 @@ def on_message(client, userdata, msg):
         if scenario_c:
             scenario_c.handle_mqtt(station, metric, payload, now)
 
+        if scenario_d:
+            scenario_d.handle_mqtt(station, metric, payload, now)
+
     except Exception:
         logger.exception("Error processing MQTT message")
 
@@ -784,6 +868,9 @@ def monitor_loop():
 
         if scenario_c:
             scenario_c.check_and_alert(now)
+
+        if scenario_d:
+            scenario_d.check_and_alert(now)
 
         time.sleep(CHECK_INTERVAL)
 
@@ -807,7 +894,7 @@ def main():
     )
     logger.info(
         f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} "
-        f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT}"
+        f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT} lux={ENABLE_SCENARIO_LUX}"
     )
 
     if MAILJET_BCC:
