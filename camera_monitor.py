@@ -94,6 +94,9 @@ TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 # Optional: separate "silence" timeout (no MQTT messages at all)
 SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=25)
 
+LUX_TIMEOUT_MINUTES = config.getint("monitor", "lux_timeout_minutes", fallback=25)
+
+
 # If NOTHING arrives from MQTT at all for this long, treat it as a local/server outage
 # and suppress Scenario PiAndCameraDown emails (prevents “email burst” when MQTT returns).
 GLOBAL_OUTAGE_MINUTES = config.getint("monitor", "global_outage_minutes", fallback=10)
@@ -224,12 +227,13 @@ def get_active_stations():
         """
         SELECT station
         FROM stations
-        WHERE COALESCE(unsubscribed, 0) = 0
+        WHERE COALESCE(CAST(TRIM(unsubscribed) AS INTEGER), 0) = 0
         """
     )
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
+
 
 
 def get_reboot_watch_stations():
@@ -244,13 +248,14 @@ def get_reboot_watch_stations():
         """
         SELECT station
         FROM stations
-        WHERE COALESCE(reboot, 0) = 1
-          AND COALESCE(unsubscribed, 0) = 0
+        WHERE COALESCE(CAST(reboot AS INTEGER), 0) = 1
+          AND COALESCE(CAST(TRIM(unsubscribed) AS INTEGER), 0) = 0
         """
     )
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
+
 
 
 def get_lux_watch_stations():
@@ -265,13 +270,14 @@ def get_lux_watch_stations():
         """
         SELECT station
         FROM stations
-        WHERE COALESCE(lux, 0) = 1
-          AND COALESCE(unsubscribed, 0) = 0
+        WHERE COALESCE(CAST(lux AS INTEGER), 0) = 1
+          AND COALESCE(CAST(TRIM(unsubscribed) AS INTEGER), 0) = 0
         """
     )
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
+
 
 
 # ----------------------------
@@ -737,7 +743,6 @@ class ScenarioHasntRebooted:
             )
             record_alert_sent(station, "hasnt_rebooted", now)
 
-
 class ScenarioLuxmeterDown:
     """
     Scenario D:
@@ -745,9 +750,11 @@ class ScenarioLuxmeterDown:
       - If payload == '0' -> luxmeter down (track first down time)
       - If payload == '1' -> recovered (clear state)
       - ONLY applies to stations where stations.lux = 1 and unsubscribed = 0
+      - Sends first alert only after lux_timeout_minutes
       - Uses the shared reminder/escalation logic via alert_state and should_send_alert_now()
     """
-    def __init__(self):
+    def __init__(self, timeout_minutes: int):
+        self.timeout = timedelta(minutes=timeout_minutes)
         self.down_since = {}  # station -> datetime when luxmeterstatus first became 0
 
     def handle_mqtt(self, station: str, metric: str, payload: str, now: datetime):
@@ -769,6 +776,10 @@ class ScenarioLuxmeterDown:
         for station in watch:
             since = self.down_since.get(station)
             if not since:
+                continue
+
+            # ✅ wait for the configured delay, like the other scenarios
+            if (now - since) <= self.timeout:
                 continue
 
             action = should_send_alert_now(station, "luxmeter_down", now)
@@ -794,13 +805,14 @@ class ScenarioLuxmeterDown:
             record_alert_sent(station, "luxmeter_down", now)
 
 
+
 # ----------------------------
 # MQTT callbacks
 # ----------------------------
 scenario_a = ScenarioCameraStatusDown(timeout_minutes=TIMEOUT_MINUTES) if ENABLE_SCENARIO_CAMERA_STATUS else None
 scenario_b = ScenarioPiAndCameraDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if ENABLE_SCENARIO_SILENCE else None
 scenario_c = ScenarioHasntRebooted(threshold_hours=REBOOT_THRESHOLD_HOURS) if ENABLE_SCENARIO_REBOOT else None
-scenario_d = ScenarioLuxmeterDown() if ENABLE_SCENARIO_LUX else None
+scenario_d = ScenarioLuxmeterDown(timeout_minutes=LUX_TIMEOUT_MINUTES) if ENABLE_SCENARIO_LUX else None
 
 
 def on_connect(client, userdata, flags, rc):
