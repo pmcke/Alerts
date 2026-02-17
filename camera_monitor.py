@@ -16,7 +16,7 @@ import paho.mqtt.client as mqtt
 from mailjet_rest import Client
 
 # ----------------------------
-# Logging
+# Logging (journald/console)
 # ----------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +41,51 @@ TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.html"
 TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.html"
 TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.html"
 TEMPLATE_LUXMETER_DOWN = "luxmeterdown.html"
+
+# New: report log file (append-only)
+REPORT_LOG_PATH = os.path.join(BASE_DIR, "camera_monitor.log")
+
+
+def _utc_stamp(dt: datetime | None = None) -> str:
+    """UTC timestamp for the report log."""
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def report_log_line(station: str, state: str, status: str, extra: str = "", when_utc: datetime | None = None):
+    """
+    Append a single line to camera_monitor.log.
+    Format:
+      <UTC datetime>,<station>,<state>,<status>[,<extra>]
+
+    Examples:
+      2026-02-17 03:21:00 UTC,nz0014,silence_down,OCCURRING
+      2026-02-17 04:10:00 UTC,nz0014,silence_down,CORRECTED
+      2026-02-17 04:10:05 UTC,nz0014,email,SENT,to=gmn@example.com subject="..."
+    """
+    try:
+        station = (station or "").strip().lower()
+        state = (state or "").strip()
+        status = (status or "").strip()
+        ts = _utc_stamp(when_utc)
+
+        parts = [ts, station, state, status]
+        if extra:
+            parts.append(extra)
+
+        line = ",".join(parts)
+
+        # Ensure directory exists (should, but be safe)
+        os.makedirs(os.path.dirname(REPORT_LOG_PATH), exist_ok=True)
+
+        with open(REPORT_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Never let reporting break monitoring
+        logger.exception("Failed writing to report log")
+
 
 # ----------------------------
 # Load config
@@ -95,7 +140,6 @@ TIMEOUT_MINUTES = config.getint("monitor", "timeout_minutes", fallback=15)
 SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fallback=25)
 
 LUX_TIMEOUT_MINUTES = config.getint("monitor", "lux_timeout_minutes", fallback=25)
-
 
 # If NOTHING arrives from MQTT at all for this long, treat it as a local/server outage
 # and suppress Scenario PiAndCameraDown emails (prevents “email burst” when MQTT returns).
@@ -235,7 +279,6 @@ def get_active_stations():
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
 
 
-
 def get_reboot_watch_stations():
     """
     Return list of stations (lowercase) that should be checked for reboot issues:
@@ -257,7 +300,6 @@ def get_reboot_watch_stations():
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
 
 
-
 def get_lux_watch_stations():
     """
     Return list of stations (lowercase) that should be checked for luxmeter issues:
@@ -277,7 +319,6 @@ def get_lux_watch_stations():
     rows = cur.fetchall()
     conn.close()
     return [str(r[0]).strip().lower() for r in rows if r and r[0]]
-
 
 
 # ----------------------------
@@ -304,18 +345,34 @@ def ensure_alert_state_table():
 
 
 def clear_alert_state(station: str, scenario: str):
+    """
+    Deletes an alert_state record.
+    If a record existed and is removed, write a CORRECTED entry to camera_monitor.log.
+    """
     station = (station or "").strip().lower()
     scenario = (scenario or "").strip()
     if not station or not scenario:
         return
+
     conn = db_connect()
     cur = conn.cursor()
+
+    # Did a record exist?
+    cur.execute(
+        "SELECT 1 FROM alert_state WHERE station=? AND scenario=? LIMIT 1",
+        (station, scenario),
+    )
+    existed = cur.fetchone() is not None
+
     cur.execute(
         "DELETE FROM alert_state WHERE station=? AND scenario=?",
         (station, scenario),
     )
     conn.commit()
     conn.close()
+
+    if existed:
+        report_log_line(station, scenario, "CORRECTED")
 
 
 def mark_station_unsubscribed(station: str, reason: str = ""):
@@ -374,6 +431,10 @@ def should_send_alert_now(station: str, scenario: str, now: datetime) -> str:
         )
         conn.commit()
         conn.close()
+
+        # Report: entering error state (as defined by creation of alert_state record)
+        report_log_line(station, scenario, "OCCURRING", when_utc=now)
+
         return "send"
 
     last_sent_utc, send_count = row
@@ -530,6 +591,24 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
             logger.error(f"{station}: Mailjet error {result.status_code}: {result.json()}")
         else:
             logger.info(f"{station}: email sent: {subject}")
+
+            # Report: email sent (include To and any Bcc)
+            now = datetime.now(timezone.utc)
+            report_log_line(
+                station,
+                "email",
+                "SENT",
+                extra=f'to={email} subject="{subject}"',
+                when_utc=now,
+            )
+            for bcc in MAILJET_BCC:
+                report_log_line(
+                    station,
+                    "email",
+                    "SENT",
+                    extra=f'bcc={bcc} subject="{subject}"',
+                    when_utc=now,
+                )
     except Exception:
         logger.exception(f"{station}: Mailjet send failed")
 
@@ -743,6 +822,7 @@ class ScenarioHasntRebooted:
             )
             record_alert_sent(station, "hasnt_rebooted", now)
 
+
 class ScenarioLuxmeterDown:
     """
     Scenario D:
@@ -753,6 +833,7 @@ class ScenarioLuxmeterDown:
       - Sends first alert only after lux_timeout_minutes
       - Uses the shared reminder/escalation logic via alert_state and should_send_alert_now()
     """
+
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
         self.down_since = {}  # station -> datetime when luxmeterstatus first became 0
@@ -778,7 +859,7 @@ class ScenarioLuxmeterDown:
             if not since:
                 continue
 
-            # ✅ wait for the configured delay, like the other scenarios
+            # wait for the configured delay, like the other scenarios
             if (now - since) <= self.timeout:
                 continue
 
@@ -803,7 +884,6 @@ class ScenarioLuxmeterDown:
             )
 
             record_alert_sent(station, "luxmeter_down", now)
-
 
 
 # ----------------------------
@@ -897,6 +977,7 @@ def main():
     logger.info(f"DB_PATH={DB_PATH}")
     logger.info(f"TEMPLATE_DIR_PRIMARY={TEMPLATE_DIR_PRIMARY}")
     logger.info(f"TEMPLATE_DIR_FALLBACK={TEMPLATE_DIR_FALLBACK}")
+    logger.info(f"REPORT_LOG_PATH={REPORT_LOG_PATH}")
     # --------------------------------------------
 
     logger.info(
