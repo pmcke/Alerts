@@ -6,6 +6,8 @@ import hashlib
 import html
 import configparser
 from pathlib import Path
+from datetime import datetime
+import sys
 
 app = Flask(__name__)
 
@@ -31,6 +33,34 @@ PUBLIC_BASE_URL = os.environ.get(
     "UNSUBSCRIBE_PUBLIC_BASE_URL",
     config.get("app", "public_base_url", fallback=""),
 ).rstrip("/")
+
+# Camera monitor log (same folder as this script)
+CAMERA_MONITOR_LOG_PATH = BASE_DIR / "camera_monitor.log"
+
+
+# -------------------------------------------------
+# Logging helper (UTC)
+# -------------------------------------------------
+def log_camera_monitor_line(station_upper: str, message: str) -> None:
+    """
+    Append a single line to camera_monitor.log in the same folder as unsubscribe.py.
+    If the file doesn't exist, it will be created.
+
+    Format:
+      YYYY-MM-DD HH:MM:SSZ <station> <message>
+    """
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%SZ")
+    station_upper = (station_upper or "").strip().upper()
+
+    line = f"{ts} {station_upper} {message}".rstrip() + "\n"
+
+    try:
+        CAMERA_MONITOR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(CAMERA_MONITOR_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as e:
+        # Don't break unsubscribe flow if logging fails
+        print(f"[unsubscribe] WARNING: failed to write {CAMERA_MONITOR_LOG_PATH}: {e!r}", file=sys.stderr)
 
 
 # -------------------------------------------------
@@ -129,6 +159,7 @@ def sanity_check():
     print(f"[unsubscribe] CONFIG_PATH={CONFIG_PATH}")
     print(f"[unsubscribe] DB_PATH={DB_PATH}")
     print(f"[unsubscribe] PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
+    print(f"[unsubscribe] CAMERA_MONITOR_LOG_PATH={CAMERA_MONITOR_LOG_PATH}")
     print(f"[unsubscribe] SECRETS_CONFIGURED={len(_get_secrets())} (values hidden)")
 
 
@@ -269,7 +300,22 @@ def unsubscribe_do():
     if not row:
         abort(404)
 
+    already = int(row[0] or 0) == 1
+    if already:
+        # No logging here because it's not a new voluntary unsubscribe action
+        return f"""
+        <h2>Already unsubscribed</h2>
+        <p><b>{html.escape(email)}</b> is already unsubscribed for station <b>{html.escape(station_upper)}</b>.</p>
+        """
+
     db_set_unsubscribed(station_db, email)
+
+    # Log voluntary unsubscribe
+    # (line begins with UTC timestamp, then station/camera number)
+    log_camera_monitor_line(
+        station_upper,
+        f'VOLUNTARY UNSUBSCRIBE email="{email}"',
+    )
 
     return f"""
     <h2>Unsubscribed</h2>
