@@ -379,15 +379,44 @@ def mark_station_unsubscribed(station: str, reason: str = ""):
     station = (station or "").strip().lower()
     if not station:
         return
+
     conn = db_connect()
     cur = conn.cursor()
+
+    # Check current status first
+    cur.execute(
+        "SELECT unsubscribed FROM stations WHERE LOWER(station)=? LIMIT 1",
+        (station,),
+    )
+    row = cur.fetchone()
+
+    if not row:
+        conn.close()
+        return
+
+    already_unsub = int(row[0] or 0)
+
+    if already_unsub:
+        conn.close()
+        return  # do nothing if already unsubscribed
+
+    # Perform the update
     cur.execute(
         "UPDATE stations SET unsubscribed=1 WHERE station=?",
         (station,),
     )
     conn.commit()
     conn.close()
+
     logger.warning(f"{station}: auto-unsubscribed. reason={reason}")
+
+    # ---- NEW: write to camera_monitor.log ----
+    report_log_line(
+        station,
+        "auto_unsubscribe",
+        "TRIGGERED",
+        extra=f"reason={reason}"
+    )
 
 
 def _utc_iso(dt: datetime) -> str:
