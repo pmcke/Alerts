@@ -38,7 +38,7 @@ TEMPLATE_DIR_PRIMARY = os.path.join(BASE_DIR, "templates")
 TEMPLATE_DIR_FALLBACK = "/etc/camera-monitor/templates"
 
 TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.html"
-TEMPLATE_PI_AND_CAMERA_DOWN = "pi_and_camera_down.html"
+TEMPLATE_FULL_SYSTEM_DOWN = "full_system_down.html"
 TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.html"
 TEMPLATE_LUXMETER_DOWN = "luxmeterdown.html"
 
@@ -729,7 +729,7 @@ class ScenarioPiAndCameraDown:
             send_email(
                 station=station,
                 subject=f"Pi/camera offline alert: {station.upper()}",
-                template_filename=TEMPLATE_PI_AND_CAMERA_DOWN,
+                template_filename=TEMPLATE_FULL_SYSTEM_DOWN,
                 template_vars={
                     "last_seen": last_seen_str,
                     "minutes": minutes,
