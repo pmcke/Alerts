@@ -142,7 +142,7 @@ SILENCE_TIMEOUT_MINUTES = config.getint("monitor", "silence_timeout_minutes", fa
 LUX_TIMEOUT_MINUTES = config.getint("monitor", "lux_timeout_minutes", fallback=25)
 
 # If NOTHING arrives from MQTT at all for this long, treat it as a local/server outage
-# and suppress Scenario PiAndCameraDown emails (prevents “email burst” when MQTT returns).
+# and suppress Scenario FullSystemDown emails (prevents “email burst” when MQTT returns).
 GLOBAL_OUTAGE_MINUTES = config.getint("monitor", "global_outage_minutes", fallback=10)
 
 # Scenario C: "hasn't rebooted"
@@ -689,7 +689,7 @@ class ScenarioCameraStatusDown:
             record_alert_sent(station, "camera_status_down", now)
 
 
-class ScenarioPiAndCameraDown:
+class ScenarioFullSystemDown:
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
         self.silent_since = {}
@@ -704,7 +704,7 @@ class ScenarioPiAndCameraDown:
         if last_any_mqtt is None:
             logger.warning(
                 "Global MQTT silence: no messages received yet (startup). "
-                "Suppressing PiAndCameraDown only."
+                "Suppressing FullSystemDown only."
             )
             self.silent_since.clear()  # in-memory only
             return
@@ -715,7 +715,7 @@ class ScenarioPiAndCameraDown:
             logger.warning(
                 f"Global MQTT silence: no messages for {mins:.1f} minutes "
                 f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
-                "Suppressing PiAndCameraDown and clearing silence state."
+                "Suppressing FullSystemDown and clearing silence state."
             )
             self.silent_since.clear()
             for station in active:
@@ -757,7 +757,7 @@ class ScenarioPiAndCameraDown:
 
             send_email(
                 station=station,
-                subject=f"Pi/camera offline alert: {station.upper()}",
+                subject=f"Full System offline alert: {station.upper()}",
                 template_filename=TEMPLATE_FULL_SYSTEM_DOWN,
                 template_vars={
                     "last_seen": last_seen_str,
@@ -919,7 +919,7 @@ class ScenarioLuxmeterDown:
 # MQTT callbacks
 # ----------------------------
 scenario_a = ScenarioCameraStatusDown(timeout_minutes=TIMEOUT_MINUTES) if ENABLE_SCENARIO_CAMERA_STATUS else None
-scenario_b = ScenarioPiAndCameraDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if ENABLE_SCENARIO_SILENCE else None
+scenario_b = ScenarioFullSystemDown(timeout_minutes=SILENCE_TIMEOUT_MINUTES) if ENABLE_SCENARIO_SILENCE else None
 scenario_c = ScenarioHasntRebooted(threshold_hours=REBOOT_THRESHOLD_HOURS) if ENABLE_SCENARIO_REBOOT else None
 scenario_d = ScenarioLuxmeterDown(timeout_minutes=LUX_TIMEOUT_MINUTES) if ENABLE_SCENARIO_LUX else None
 
