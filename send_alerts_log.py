@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Email the last 20 lines of camera_monitor.log.
+Email the last 50 lines of camera_monitor.log.
 
 This script reuses Mailjet/config/logging helpers from camera_monitor.py.
 It is intended to be run daily at 08:00 by cron or a systemd timer.
@@ -24,7 +24,7 @@ import camera_monitor as cm
 
 
 DEFAULT_LOG_PATH = Path(cm.REPORT_LOG_PATH)
-DEFAULT_LINE_COUNT = 20
+DEFAULT_LINE_COUNT = 50
 
 
 def tail_lines(path: Path, line_count: int = DEFAULT_LINE_COUNT) -> list[str]:
@@ -50,7 +50,7 @@ def build_html_body(lines: list[str]) -> str:
         escaped_lines = "(camera_monitor.log is empty)"
 
     return (
-        "<p>Last 20 lines in camera_monitor.log</p>"
+        "<p>Last 50 lines in camera_monitor.log</p>"
         f"<pre style=\"font-family: monospace; white-space: pre-wrap;\">{escaped_lines}</pre>"
     )
 
@@ -106,7 +106,7 @@ def send_log_email(recipients: list[str], log_path: Path, line_count: int = DEFA
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Email the last 20 lines of camera_monitor.log using Mailjet settings from camera_monitor.py"
+        description="Email the last 50 lines of camera_monitor.log using Mailjet settings from camera_monitor.py"
     )
     parser.add_argument(
         "--to",
