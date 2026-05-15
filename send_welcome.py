@@ -190,7 +190,7 @@ def main():
         "email": html.escape(email_in),
         "sent_utc": html.escape(now_utc),
         "support_contacts": support_html or "",
-        "unsubscribe_urlf": html.escape(unsubscribe_url),
+        "unsubscribe_url": html.escape(unsubscribe_url),
     }
 
     try:
