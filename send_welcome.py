@@ -172,17 +172,16 @@ def main():
 
     unsubscribe_url = ""
 
-    unsubscribe_url = ""
-
     if hasattr(cm, "build_unsubscribe_url"):
         unsubscribe_url = cm.build_unsubscribe_url(station_lower, email_in)
     elif hasattr(cm, "make_unsubscribe_url"):
         unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in)
-        if not unsubscribe_url:
-            die(
+
+    if not unsubscribe_url:
+        die(
             "Unsubscribe link was blank. Check that UNSUBSCRIBE_SECRET is loaded "
-            "and that unsubscribe_url/public_base_url is set in config.ini."
-    )
+            "and that mailjet.unsubscribe_url is set in config.ini."
+        )
 
     merged = {
         "station": html.escape(station_upper),
