@@ -172,13 +172,16 @@ def main():
 
     unsubscribe_url = ""
 
-    if hasattr(cm, "make_unsubscribe_url"):
-     unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in)
+    unsubscribe_url = ""
 
-    if not unsubscribe_url:
-        die(
-        "Unsubscribe link was blank. Check that UNSUBSCRIBE_SECRET is loaded "
-        "and that unsubscribe_url/public_base_url is set in config.ini."
+    if hasattr(cm, "build_unsubscribe_url"):
+        unsubscribe_url = cm.build_unsubscribe_url(station_lower, email_in)
+    elif hasattr(cm, "make_unsubscribe_url"):
+        unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in)
+        if not unsubscribe_url:
+            die(
+            "Unsubscribe link was blank. Check that UNSUBSCRIBE_SECRET is loaded "
+            "and that unsubscribe_url/public_base_url is set in config.ini."
     )
 
     merged = {
@@ -187,7 +190,7 @@ def main():
         "email": html.escape(email_in),
         "sent_utc": html.escape(now_utc),
         "support_contacts": support_html or "",
-        "unsubscribe_url": html.escape(unsubscribe_url),
+        "unsubscribe_urlf": html.escape(unsubscribe_url),
     }
 
     try:
