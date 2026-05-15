@@ -150,13 +150,18 @@ def main():
 
     now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    # Merge template vars (escape anything user-controlled)
+    unsubscribe_link = ""
+
+    if hasattr(cm, "make_unsubscribe_url"):
+        unsubscribe_link = cm.make_unsubscribe_url(station_lower, email_in)
+
     merged = {
         "station": html.escape(station_upper),
         "station_lower": html.escape(station_lower),
         "email": html.escape(email_in),
         "sent_utc": html.escape(now_utc),
         "support_contacts": support_html or "",
+        "unsubscribe_link": html.escape(unsubscribe_link),
     }
 
     try:
