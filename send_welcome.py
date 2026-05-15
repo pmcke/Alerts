@@ -22,6 +22,26 @@ import sqlite3
 import configparser
 from datetime import datetime, timezone
 
+def load_env_file(path):
+    if not os.path.isfile(path):
+        return
+
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+
+            # Don't overwrite existing environment vars
+            os.environ.setdefault(key.strip(), value.strip())
+
+
+# Load optional secrets file
+load_env_file("/etc/fireballsalerts/secrets.env")
+
 
 def die(msg: str, code: int = 2):
     print(f"ERROR: {msg}", file=sys.stderr)
