@@ -170,12 +170,12 @@ def main():
 
     now_utc = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-    unsubscribe_link = ""
+    unsubscribe_url = ""
 
     if hasattr(cm, "make_unsubscribe_url"):
-     unsubscribe_link = cm.make_unsubscribe_url(station_lower, email_in)
+     unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in)
 
-    if not unsubscribe_link:
+    if not unsubscribe_url:
         die(
         "Unsubscribe link was blank. Check that UNSUBSCRIBE_SECRET is loaded "
         "and that unsubscribe_url/public_base_url is set in config.ini."
@@ -187,7 +187,7 @@ def main():
         "email": html.escape(email_in),
         "sent_utc": html.escape(now_utc),
         "support_contacts": support_html or "",
-        "unsubscribe_link": html.escape(unsubscribe_link),
+        "unsubscribe_url": html.escape(unsubscribe_url),
     }
 
     try:
