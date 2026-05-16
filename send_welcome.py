@@ -172,10 +172,16 @@ def main():
 
     unsubscribe_url = ""
 
-    if hasattr(cm, "build_unsubscribe_url"):
-        unsubscribe_url = cm.build_unsubscribe_url(station_lower, email_in)
+    if hasattr(cm, "build_unsubscribe_link"):
+	    unsubscribe_url = cm.build_unsubscribe_link(
+         	   cm.UNSUB_BASE_URL,
+                   station_upper,
+                   email_in,
+)
+    elif hasattr(cm, "build_unsubscribe_url"):
+            unsubscribe_url = cm.build_unsubscribe_url(station_lower, email_in)
     elif hasattr(cm, "make_unsubscribe_url"):
-        unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in)
+            unsubscribe_url = cm.make_unsubscribe_url(station_lower, email_in) 
 
     if not unsubscribe_url:
         die(
