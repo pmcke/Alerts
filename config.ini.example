@@ -21,6 +21,7 @@ enable_camera_status_scenario = true
 enable_silence_scenario = true
 enable_reboot_scenario = true
 enable_lux_scenario = true
+enable_fault_corrected_email = true
 
 [mailjet]
 api_key = YOUR API KEY
