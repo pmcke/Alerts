@@ -41,6 +41,7 @@ TEMPLATE_CAMERA_ONLY_DOWN = "camera_only_down.html"
 TEMPLATE_FULL_SYSTEM_DOWN = "full_system_down.html"
 TEMPLATE_HASNT_REBOOTED = "hasnt_rebooted.html"
 TEMPLATE_LUXMETER_DOWN = "luxmeterdown.html"
+TEMPLATE_FAULT_CORRECTED = "fault_corrected.html"
 
 # New: report log file (append-only)
 REPORT_LOG_PATH = os.path.join(BASE_DIR, "camera_monitor.log")
@@ -157,6 +158,7 @@ ENABLE_SCENARIO_CAMERA_STATUS = config.getboolean("monitor", "enable_camera_stat
 ENABLE_SCENARIO_SILENCE = config.getboolean("monitor", "enable_silence_scenario", fallback=True)
 ENABLE_SCENARIO_REBOOT = config.getboolean("monitor", "enable_reboot_scenario", fallback=True)
 ENABLE_SCENARIO_LUX = config.getboolean("monitor", "enable_lux_scenario", fallback=True)
+ENABLE_FAULT_CORRECTED_EMAIL = config.getboolean("monitor", "enable_fault_corrected_email", fallback=False)
 
 # Mailjet
 MAILJET_API_KEY = config.get("mailjet", "api_key", fallback="")
@@ -344,10 +346,54 @@ def ensure_alert_state_table():
     conn.close()
 
 
-def clear_alert_state(station: str, scenario: str):
+def scenario_display_name(scenario: str) -> str:
+    """Human-readable names for scenario IDs used in alert_state/logs."""
+    names = {
+        "camera_status_down": "Camera offline",
+        "silence_down": "Full system offline",
+        "hasnt_rebooted": "Reboot failure",
+        "luxmeter_down": "Luxmeter offline",
+    }
+    scenario = (scenario or "").strip()
+    return names.get(scenario, scenario.replace("_", " ").strip().title())
+
+
+def send_fault_corrected_email(station: str, scenario: str, when_utc: datetime | None = None):
+    """Send a fault-corrected notification, if enabled in config.ini."""
+    if not ENABLE_FAULT_CORRECTED_EMAIL:
+        return
+
+    station = (station or "").strip().lower()
+    scenario = (scenario or "").strip()
+    if not station or not scenario:
+        return
+
+    if when_utc is None:
+        when_utc = datetime.now(timezone.utc)
+    when_utc = when_utc.astimezone(timezone.utc).replace(microsecond=0)
+
+    corrected_time = when_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    fault_name = scenario_display_name(scenario)
+
+    send_email(
+        station=station,
+        subject=f"Fault corrected: {station.upper()} - {fault_name}",
+        template_filename=TEMPLATE_FAULT_CORRECTED,
+        template_vars={
+            "time": corrected_time,
+            "corrected_time": corrected_time,
+            "scenario": htmlmod.escape(scenario),
+            "fault": htmlmod.escape(fault_name),
+            "fault_name": htmlmod.escape(fault_name),
+        },
+    )
+
+
+def clear_alert_state(station: str, scenario: str, notify_corrected: bool = True):
     """
     Deletes an alert_state record.
     If a record existed and is removed, write a CORRECTED entry to camera_monitor.log.
+    If enabled, also send fault_corrected.html through the normal email path.
     """
     station = (station or "").strip().lower()
     scenario = (scenario or "").strip()
@@ -372,7 +418,10 @@ def clear_alert_state(station: str, scenario: str):
     conn.close()
 
     if existed:
-        report_log_line(station, scenario, "CORRECTED")
+        now = datetime.now(timezone.utc)
+        report_log_line(station, scenario, "CORRECTED", when_utc=now)
+        if notify_corrected:
+            send_fault_corrected_email(station, scenario, when_utc=now)
 
 
 def mark_station_unsubscribed(station: str, reason: str = ""):
@@ -672,7 +721,7 @@ class ScenarioCameraStatusDown:
 
             if action == "auto_unsub":
                 mark_station_unsubscribed(station, reason="camera_status_down not resolved after repeats")
-                clear_alert_state(station, "camera_status_down")
+                clear_alert_state(station, "camera_status_down", notify_corrected=False)
                 self.offline_since.pop(station, None)
                 continue
 
@@ -719,7 +768,7 @@ class ScenarioFullSystemDown:
             )
             self.silent_since.clear()
             for station in active:
-                clear_alert_state(station, "silence_down")
+                clear_alert_state(station, "silence_down", notify_corrected=False)
             return
         # ------------------------------------------
 
@@ -744,7 +793,7 @@ class ScenarioFullSystemDown:
 
             if action == "auto_unsub":
                 mark_station_unsubscribed(station, reason="silence_down not resolved after repeats")
-                clear_alert_state(station, "silence_down")
+                clear_alert_state(station, "silence_down", notify_corrected=False)
                 self.silent_since.pop(station, None)
                 continue
 
@@ -834,7 +883,7 @@ class ScenarioHasntRebooted:
 
             if action == "auto_unsub":
                 mark_station_unsubscribed(station, reason="hasnt_rebooted not resolved after repeats")
-                clear_alert_state(station, "hasnt_rebooted")
+                clear_alert_state(station, "hasnt_rebooted", notify_corrected=False)
                 continue
 
             if action == "skip":
@@ -896,7 +945,7 @@ class ScenarioLuxmeterDown:
 
             if action == "auto_unsub":
                 mark_station_unsubscribed(station, reason="luxmeter_down not resolved after repeats")
-                clear_alert_state(station, "luxmeter_down")
+                clear_alert_state(station, "luxmeter_down", notify_corrected=False)
                 self.down_since.pop(station, None)
                 continue
 
@@ -1018,6 +1067,7 @@ def main():
         f"Scenarios enabled: camera_status={ENABLE_SCENARIO_CAMERA_STATUS} "
         f"silence={ENABLE_SCENARIO_SILENCE} reboot={ENABLE_SCENARIO_REBOOT} lux={ENABLE_SCENARIO_LUX}"
     )
+    logger.info(f"Fault-corrected emails enabled: {ENABLE_FAULT_CORRECTED_EMAIL}")
 
     if MAILJET_BCC:
         logger.info(f"Mailjet BCC enabled ({len(MAILJET_BCC)} recipient(s))")
