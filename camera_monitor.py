@@ -358,8 +358,40 @@ def scenario_display_name(scenario: str) -> str:
     return names.get(scenario, scenario.replace("_", " ").strip().title())
 
 
-def send_fault_corrected_email(station: str, scenario: str, when_utc: datetime | None = None):
-    """Send a fault-corrected notification, if enabled in config.ini."""
+def _parse_utc_from_db(value: str, fallback: datetime | None = None) -> datetime:
+    """Parse a UTC datetime string from SQLite alert_state fields."""
+    if fallback is None:
+        fallback = datetime.now(timezone.utc)
+
+    try:
+        s = str(value or "").strip().replace("Z", "+00:00")
+        if not s:
+            return fallback.astimezone(timezone.utc).replace(microsecond=0)
+
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+
+        return dt.replace(microsecond=0)
+    except Exception:
+        logger.warning(f"Could not parse alert_state UTC datetime: {value!r}")
+        return fallback.astimezone(timezone.utc).replace(microsecond=0)
+
+
+def send_fault_corrected_email(
+    station: str,
+    scenario: str,
+    first_sent_utc: datetime | None = None,
+    corrected_utc: datetime | None = None,
+):
+    """
+    Send a fault-corrected notification, if enabled in config.ini.
+
+    The {time} placeholder is the original alert_state.first_sent_utc value,
+    i.e. when the fault was first recorded as occurring/sent.
+    """
     if not ENABLE_FAULT_CORRECTED_EMAIL:
         return
 
@@ -368,11 +400,16 @@ def send_fault_corrected_email(station: str, scenario: str, when_utc: datetime |
     if not station or not scenario:
         return
 
-    if when_utc is None:
-        when_utc = datetime.now(timezone.utc)
-    when_utc = when_utc.astimezone(timezone.utc).replace(microsecond=0)
+    if corrected_utc is None:
+        corrected_utc = datetime.now(timezone.utc)
+    corrected_utc = corrected_utc.astimezone(timezone.utc).replace(microsecond=0)
 
-    corrected_time = when_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    if first_sent_utc is None:
+        first_sent_utc = corrected_utc
+    first_sent_utc = first_sent_utc.astimezone(timezone.utc).replace(microsecond=0)
+
+    fault_start_time = first_sent_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    corrected_time = corrected_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
     fault_name = scenario_display_name(scenario)
 
     send_email(
@@ -380,7 +417,9 @@ def send_fault_corrected_email(station: str, scenario: str, when_utc: datetime |
         subject=f"Fault corrected: {station.upper()} - {fault_name}",
         template_filename=TEMPLATE_FAULT_CORRECTED,
         template_vars={
-            "time": corrected_time,
+            "time": fault_start_time,
+            "first_sent_utc": fault_start_time,
+            "fault_start_time": fault_start_time,
             "corrected_time": corrected_time,
             "scenario": htmlmod.escape(scenario),
             "fault": htmlmod.escape(fault_name),
@@ -394,6 +433,9 @@ def clear_alert_state(station: str, scenario: str, notify_corrected: bool = True
     Deletes an alert_state record.
     If a record existed and is removed, write a CORRECTED entry to camera_monitor.log.
     If enabled, also send fault_corrected.html through the normal email path.
+
+    The corrected email uses alert_state.first_sent_utc for the template {time}
+    value, so read it before deleting the row.
     """
     station = (station or "").strip().lower()
     scenario = (scenario or "").strip()
@@ -403,12 +445,14 @@ def clear_alert_state(station: str, scenario: str, notify_corrected: bool = True
     conn = db_connect()
     cur = conn.cursor()
 
-    # Did a record exist?
+    # Did a record exist? If so, preserve first_sent_utc before deleting it.
     cur.execute(
-        "SELECT 1 FROM alert_state WHERE station=? AND scenario=? LIMIT 1",
+        "SELECT first_sent_utc FROM alert_state WHERE station=? AND scenario=? LIMIT 1",
         (station, scenario),
     )
-    existed = cur.fetchone() is not None
+    row = cur.fetchone()
+    existed = row is not None
+    first_sent_utc = _parse_utc_from_db(row[0]) if existed else None
 
     cur.execute(
         "DELETE FROM alert_state WHERE station=? AND scenario=?",
@@ -418,10 +462,15 @@ def clear_alert_state(station: str, scenario: str, notify_corrected: bool = True
     conn.close()
 
     if existed:
-        now = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
         report_log_line(station, scenario, "CORRECTED", when_utc=now)
         if notify_corrected:
-            send_fault_corrected_email(station, scenario, when_utc=now)
+            send_fault_corrected_email(
+                station,
+                scenario,
+                first_sent_utc=first_sent_utc,
+                corrected_utc=now,
+            )
 
 
 def mark_station_unsubscribed(station: str, reason: str = ""):
