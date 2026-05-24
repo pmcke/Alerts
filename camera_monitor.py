@@ -608,6 +608,36 @@ def record_alert_sent(station: str, scenario: str, now: datetime):
     conn.close()
 
 
+def get_alert_send_count(station: str, scenario: str):
+    """Return alert_state.send_count for station/scenario, or None if unavailable."""
+    station = (station or "").strip().lower()
+    scenario = (scenario or "").strip()
+    if not station or not scenario:
+        return None
+
+    conn = db_connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT send_count
+        FROM alert_state
+        WHERE station=? AND scenario=?
+        LIMIT 1
+        """,
+        (station, scenario),
+    )
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    try:
+        return int(row[0] or 0)
+    except Exception:
+        return None
+
+
 # ----------------------------
 # Unsubscribe link helpers (signed)
 # ----------------------------
@@ -658,13 +688,21 @@ def load_template(template_filename: str) -> str:
 # ----------------------------
 # Email sending
 # ----------------------------
-def send_email(station: str, subject: str, template_filename: str, template_vars: dict):
+def send_email(
+    station: str,
+    subject: str,
+    template_filename: str,
+    template_vars: dict,
+    alert_scenario: str | None = None,
+):
     """
     Common email sender.
     - station: lowercase id (db key)
     - subject: email subject line
     - template_filename: which template file to load
     - template_vars: dict used with template.format(...)
+    - alert_scenario: if set, increment alert_state.send_count after a successful
+      Mailjet send and append the resulting count to camera_monitor.log email lines.
     """
     station = (station or "").strip().lower()
     record = get_recipient(station)
@@ -719,13 +757,22 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
         else:
             logger.info(f"{station}: email sent: {subject}")
 
-            # Report: email sent (include To and any Bcc)
-            now = datetime.now(timezone.utc)
+            # Report: email sent (include To and any Bcc).
+            # If this is an alert email, record the successful send first so the
+            # log line shows the updated alert_state.send_count, e.g. subject="..."(3).
+            now = datetime.now(timezone.utc).replace(microsecond=0)
+            send_count_suffix = ""
+            if alert_scenario:
+                record_alert_sent(station, alert_scenario, now)
+                send_count = get_alert_send_count(station, alert_scenario)
+                if send_count is not None:
+                    send_count_suffix = f"({send_count})"
+
             report_log_line(
                 station,
                 "email",
                 "SENT",
-                extra=f'to={email} subject="{subject}"',
+                extra=f'to={email} subject="{subject}"{send_count_suffix}',
                 when_utc=now,
             )
             for bcc in MAILJET_BCC:
@@ -733,7 +780,7 @@ def send_email(station: str, subject: str, template_filename: str, template_vars
                     station,
                     "email",
                     "SENT",
-                    extra=f'bcc={bcc} subject="{subject}"',
+                    extra=f'bcc={bcc} subject="{subject}"{send_count_suffix}',
                     when_utc=now,
                 )
     except Exception:
@@ -783,8 +830,8 @@ class ScenarioCameraStatusDown:
                 subject=f"Camera offline alert: {station.upper()}",
                 template_filename=TEMPLATE_CAMERA_ONLY_DOWN,
                 template_vars={"time": time_str},
+                alert_scenario="camera_status_down",
             )
-            record_alert_sent(station, "camera_status_down", now)
 
 
 class ScenarioFullSystemDown:
@@ -862,8 +909,8 @@ class ScenarioFullSystemDown:
                     "minutes": minutes,
                     "time": last_seen_str,
                 },
+                alert_scenario="silence_down",
             )
-            record_alert_sent(station, "silence_down", now)
 
 
 class ScenarioHasntRebooted:
@@ -946,8 +993,8 @@ class ScenarioHasntRebooted:
                     "lastboot": lb_str,
                     "hours": f"{hours:.2f}",
                 },
+                alert_scenario="hasnt_rebooted",
             )
-            record_alert_sent(station, "hasnt_rebooted", now)
 
 
 class ScenarioLuxmeterDown:
@@ -1008,9 +1055,8 @@ class ScenarioLuxmeterDown:
                 subject=f"Luxmeter offline alert: {station.upper()}",
                 template_filename=TEMPLATE_LUXMETER_DOWN,
                 template_vars={"time": time_str},
+                alert_scenario="luxmeter_down",
             )
-
-            record_alert_sent(station, "luxmeter_down", now)
 
 
 # ----------------------------
