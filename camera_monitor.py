@@ -146,6 +146,17 @@ LUX_TIMEOUT_MINUTES = config.getint("monitor", "lux_timeout_minutes", fallback=2
 # and suppress Scenario FullSystemDown emails (prevents “email burst” when MQTT returns).
 GLOBAL_OUTAGE_MINUTES = config.getint("monitor", "global_outage_minutes", fallback=10)
 
+# If this percentage of active stations are overdue for silence_down at the same
+# time, assume this is probably an MQTT/broker/monitoring path problem rather
+# than many real station failures. This suppresses individual FullSystemDown
+# emails. Set to 0 to disable percentage-based suppression.
+GLOBAL_OUTAGE_STATION_PERCENT = config.getfloat(
+    "monitor",
+    "global_outage_station_percent",
+    fallback=40.0,
+)
+GLOBAL_OUTAGE_STATION_PERCENT = max(0.0, min(100.0, GLOBAL_OUTAGE_STATION_PERCENT))
+
 # Scenario C: "hasn't rebooted"
 REBOOT_THRESHOLD_HOURS = config.getint("monitor", "reboot_threshold_hours", fallback=30)
 
@@ -838,35 +849,57 @@ class ScenarioFullSystemDown:
     def __init__(self, timeout_minutes: int):
         self.timeout = timedelta(minutes=timeout_minutes)
         self.silent_since = {}
+        self.global_outage_active = False
+        self.global_outage_reason = None
 
-    def check_and_alert(self, now: datetime):
-        active = get_active_stations()
+    def _set_global_outage_active(self, now: datetime, reason: str, extra: str):
+        """
+        Write one camera_monitor.log entry when entering a global outage.
+        Do not write repeated OCCURRING lines while the same condition remains active.
+        """
+        if not self.global_outage_active or self.global_outage_reason != reason:
+            if self.global_outage_active and self.global_outage_reason != reason:
+                report_log_line(
+                    "system",
+                    "global_outage",
+                    "CORRECTED",
+                    extra=f"previous_reason={self.global_outage_reason} new_reason={reason}",
+                    when_utc=now,
+                )
 
-        # -------- Global outage suppression --------
-        outage_threshold = timedelta(minutes=GLOBAL_OUTAGE_MINUTES)
-
-        # On startup (last_any_mqtt is None), suppress but DO NOT clear DB state.
-        if last_any_mqtt is None:
-            logger.warning(
-                "Global MQTT silence: no messages received yet (startup). "
-                "Suppressing FullSystemDown only."
+            self.global_outage_active = True
+            self.global_outage_reason = reason
+            report_log_line(
+                "system",
+                "global_outage",
+                "OCCURRING",
+                extra=extra,
+                when_utc=now,
             )
-            self.silent_since.clear()  # in-memory only
-            return
 
-        # After startup, treat extended silence as local/server outage and clear state to avoid bursts
-        if (now - last_any_mqtt) > outage_threshold:
-            mins = (now - last_any_mqtt).total_seconds() / 60.0
-            logger.warning(
-                f"Global MQTT silence: no messages for {mins:.1f} minutes "
-                f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
-                "Suppressing FullSystemDown and clearing silence state."
+    def _clear_global_outage_if_recovered(self, now: datetime, extra: str):
+        """Write one CORRECTED line when leaving global outage mode."""
+        if self.global_outage_active:
+            report_log_line(
+                "system",
+                "global_outage",
+                "CORRECTED",
+                extra=extra,
+                when_utc=now,
             )
-            self.silent_since.clear()
-            for station in active:
-                clear_alert_state(station, "silence_down", notify_corrected=False)
-            return
-        # ------------------------------------------
+            self.global_outage_active = False
+            self.global_outage_reason = None
+
+    def _build_overdue_silent_stations(self, active, now: datetime):
+        """
+        Update per-station silence tracking and return stations that are overdue.
+
+        A station is only counted as overdue after it has been silent for the
+        configured silence timeout. This avoids treating normal startup, or a
+        station that has simply not reported yet in this process, as a mass
+        broker outage.
+        """
+        overdue = []
 
         for station in active:
             seen = last_seen.get(station)
@@ -882,8 +915,93 @@ class ScenarioFullSystemDown:
 
             silent_start = self.silent_since[station]
 
-            if (now - silent_start) <= self.timeout:
-                continue
+            if (now - silent_start) > self.timeout:
+                overdue.append(station)
+
+        return overdue
+
+    def check_and_alert(self, now: datetime):
+        active = get_active_stations()
+
+        # -------- Global outage suppression --------
+        outage_threshold = timedelta(minutes=GLOBAL_OUTAGE_MINUTES)
+
+        # On startup (last_any_mqtt is None), suppress but DO NOT clear DB state
+        # and DO NOT log a global outage yet. The monitor has not seen any MQTT
+        # traffic, so there is no meaningful outage/recovery transition to log.
+        if last_any_mqtt is None:
+            logger.warning(
+                "Global MQTT silence: no messages received yet (startup). "
+                "Suppressing FullSystemDown only."
+            )
+            self.silent_since.clear()  # in-memory only
+            return
+
+        # After startup, treat extended silence as local/server/broker outage.
+        # This catches cases where no MQTT messages at all are reaching the monitor.
+        if (now - last_any_mqtt) > outage_threshold:
+            mins = (now - last_any_mqtt).total_seconds() / 60.0
+            logger.warning(
+                f"Global MQTT silence: no messages for {mins:.1f} minutes "
+                f"(threshold {GLOBAL_OUTAGE_MINUTES}m). "
+                "Suppressing FullSystemDown and clearing silence state."
+            )
+            self._set_global_outage_active(
+                now,
+                reason="mqtt_silence",
+                extra=f"reason=mqtt_silence minutes={mins:.1f} threshold_minutes={GLOBAL_OUTAGE_MINUTES}",
+            )
+            self.silent_since.clear()
+            for station in active:
+                clear_alert_state(station, "silence_down", notify_corrected=False)
+            return
+
+        overdue = self._build_overdue_silent_stations(active, now)
+
+        # If a large percentage of active stations are overdue at once, assume
+        # this is probably an MQTT/broker/monitoring-path problem. Suppress the
+        # individual FullSystemDown emails and log one system-level event instead.
+        active_count = len(active)
+        overdue_count = len(overdue)
+        overdue_percent = (overdue_count / active_count * 100.0) if active_count else 0.0
+
+        if (
+            GLOBAL_OUTAGE_STATION_PERCENT > 0
+            and active_count > 0
+            and overdue_count > 0
+            and overdue_percent >= GLOBAL_OUTAGE_STATION_PERCENT
+        ):
+            logger.warning(
+                f"Possible MQTT/broker outage: {overdue_count}/{active_count} "
+                f"active stations ({overdue_percent:.1f}%) are overdue for silence_down "
+                f"(threshold {GLOBAL_OUTAGE_STATION_PERCENT:.1f}%). "
+                "Suppressing individual FullSystemDown emails."
+            )
+            self._set_global_outage_active(
+                now,
+                reason="silent_station_percent",
+                extra=(
+                    f"reason=silent_station_percent silent_stations={overdue_count} "
+                    f"active_stations={active_count} percent={overdue_percent:.1f} "
+                    f"threshold_percent={GLOBAL_OUTAGE_STATION_PERCENT:.1f}"
+                ),
+            )
+            for station in overdue:
+                clear_alert_state(station, "silence_down", notify_corrected=False)
+            return
+
+        self._clear_global_outage_if_recovered(
+            now,
+            extra=(
+                f"mqtt_traffic_ok silent_stations={overdue_count} "
+                f"active_stations={active_count} percent={overdue_percent:.1f}"
+            ),
+        )
+        # ------------------------------------------
+
+        for station in overdue:
+            seen = last_seen.get(station)
+            silent_start = self.silent_since.get(station, now)
 
             action = should_send_alert_now(station, "silence_down", now)
 
@@ -911,7 +1029,6 @@ class ScenarioFullSystemDown:
                 },
                 alert_scenario="silence_down",
             )
-
 
 class ScenarioHasntRebooted:
     def __init__(self, threshold_hours: int):
@@ -1155,7 +1272,9 @@ def main():
 
     logger.info(
         f"Timeout minutes={TIMEOUT_MINUTES}, silence timeout minutes={SILENCE_TIMEOUT_MINUTES}, "
-        f"global outage minutes={GLOBAL_OUTAGE_MINUTES}, reboot threshold hours={REBOOT_THRESHOLD_HOURS}, "
+        f"global outage minutes={GLOBAL_OUTAGE_MINUTES}, "
+        f"global outage station percent={GLOBAL_OUTAGE_STATION_PERCENT:.1f}, "
+        f"reboot threshold hours={REBOOT_THRESHOLD_HOURS}, "
         f"check interval seconds={CHECK_INTERVAL}"
     )
     logger.info(
