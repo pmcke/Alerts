@@ -1033,58 +1033,119 @@ class ScenarioFullSystemDown:
 class ScenarioHasntRebooted:
     def __init__(self, threshold_hours: int):
         self.threshold = timedelta(hours=threshold_hours)
+
+        # Value reported in the MQTT lastboot message
         self.lastboot = {}
+
+        # Time at which this monitor received the lastboot message
+        self.lastboot_received = {}
 
     def _parse_lastboot_utc(self, s: str):
         if not s:
             return None
+
         s = str(s).strip()
 
         try:
-            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            return dt
+            return datetime.strptime(
+                s,
+                "%Y-%m-%d %H:%M:%S"
+            ).replace(tzinfo=timezone.utc)
         except Exception:
             pass
 
         try:
             s2 = s.replace("Z", "+00:00")
             dt = datetime.fromisoformat(s2)
+
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             else:
                 dt = dt.astimezone(timezone.utc)
+
             return dt
         except Exception:
             return None
 
-    def handle_mqtt(self, station: str, metric: str, payload: str, now: datetime):
+    def handle_mqtt(
+        self,
+        station: str,
+        metric: str,
+        payload: str,
+        now: datetime
+    ):
         if metric != "lastboot":
             return
 
         parsed = self._parse_lastboot_utc(payload)
+
         if not parsed:
-            logger.warning(f"{station} lastboot payload could not be parsed: {payload!r}")
+            logger.warning(
+                f"{station} lastboot payload could not be parsed: {payload!r}"
+            )
             return
 
-        prev = self.lastboot.get(station)
-        self.lastboot[station] = parsed
+        previous = self.lastboot.get(station)
 
-        if prev and parsed > prev:
+        self.lastboot[station] = parsed
+        self.lastboot_received[station] = now
+
+        # A later lastboot value means the station has rebooted.
+        if previous and parsed > previous:
             clear_alert_state(station, "hasnt_rebooted")
 
     def check_and_alert(self, now: datetime):
-        if (last_any_mqtt is None) or ((now - last_any_mqtt) > timedelta(minutes=GLOBAL_OUTAGE_MINUTES)):
-            logger.warning("Global MQTT silence — suppressing HasntRebooted checks")
+        # Suppress all reboot checking if the whole MQTT connection is silent.
+        if (
+            last_any_mqtt is None
+            or
+            (now - last_any_mqtt)
+            > timedelta(minutes=GLOBAL_OUTAGE_MINUTES)
+        ):
+            logger.warning(
+                "Global MQTT silence — suppressing HasntRebooted checks"
+            )
             return
 
         watch = get_reboot_watch_stations()
 
         for station in watch:
+            station_last_seen = last_seen.get(station)
+
+            # Do not issue a reboot alert for a station that is itself offline.
+            # Full System Down is the appropriate alert in this situation.
+            if (
+                station_last_seen is None
+                or
+                (now - station_last_seen)
+                > timedelta(minutes=SILENCE_TIMEOUT_MINUTES)
+            ):
+                logger.debug(
+                    f"{station}: station is silent; "
+                    "suppressing HasntRebooted check"
+                )
+                continue
+
             lb = self.lastboot.get(station)
-            if not lb:
+            lb_received = self.lastboot_received.get(station)
+
+            if not lb or not lb_received:
+                continue
+
+            # The station may have just recovered and started sending other
+            # metrics. Wait until it has also supplied a fresh lastboot value.
+            if (
+                now - lb_received
+                > timedelta(minutes=SILENCE_TIMEOUT_MINUTES)
+            ):
+                logger.debug(
+                    f"{station}: lastboot information is stale; "
+                    "suppressing HasntRebooted check"
+                )
                 continue
 
             age = now - lb
+
             if age <= self.threshold:
                 clear_alert_state(station, "hasnt_rebooted")
                 continue
@@ -1092,11 +1153,24 @@ class ScenarioHasntRebooted:
             hours = age.total_seconds() / 3600.0
             lb_str = lb.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-            action = should_send_alert_now(station, "hasnt_rebooted", now)
+            action = should_send_alert_now(
+                station,
+                "hasnt_rebooted",
+                now
+            )
 
             if action == "auto_unsub":
-                mark_station_unsubscribed(station, reason="hasnt_rebooted not resolved after repeats")
-                clear_alert_state(station, "hasnt_rebooted", notify_corrected=False)
+                mark_station_unsubscribed(
+                    station,
+                    reason=(
+                        "hasnt_rebooted not resolved after repeats"
+                    )
+                )
+                clear_alert_state(
+                    station,
+                    "hasnt_rebooted",
+                    notify_corrected=False
+                )
                 continue
 
             if action == "skip":
@@ -1104,7 +1178,9 @@ class ScenarioHasntRebooted:
 
             send_email(
                 station=station,
-                subject=f"Reboot failure alert: {station.upper()}",
+                subject=(
+                    f"Reboot failure alert: {station.upper()}"
+                ),
                 template_filename=TEMPLATE_HASNT_REBOOTED,
                 template_vars={
                     "lastboot": lb_str,
