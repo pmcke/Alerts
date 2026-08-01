@@ -4,3 +4,4 @@ stations.db
 venv
 *.deb
 *.bak
+*.ini
