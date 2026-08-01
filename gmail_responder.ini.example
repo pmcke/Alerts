@@ -1,0 +1,41 @@
+# gmail_responder.ini
+#
+# Protect this file because it contains a Gmail credential:
+#   chmod 600 gmail_responder.ini
+#
+# Gmail normally requires a Google App Password here, not your ordinary
+# Google account password.
+
+[gmail]
+username = your-gmail-account@gmail.com
+password = paste-app-password-here
+imap_host = imap.gmail.com
+mailbox = INBOX
+
+[filter]
+from_address = messages@example.com
+subject = New website message
+exact_subject = true
+only_unseen = true
+
+[extraction]
+# The script uses the named group "email" as the destination address.
+# This default finds the first normal email address anywhere in the body.
+recipient_regex = (?P<email>[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})
+
+# Optional comma-separated safety restriction. Leave blank to permit any domain.
+# Example:
+# allowed_domains = gmail.com, outlook.com, xtra.co.nz
+allowed_domains =
+
+[response]
+subject = Thank you for your message
+template = gmail_thank_you.html
+
+[monitor]
+poll_seconds = 60
+
+# A Gmail IMAP keyword is applied only after Mailjet reports success.
+# This prevents the same message being answered again.
+processed_keyword = GmailResponderProcessed
+mark_as_read = true
