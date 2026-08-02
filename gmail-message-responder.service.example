@@ -1,0 +1,15 @@
+[Unit]
+Description=Gmail message responder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pmcke
+WorkingDirectory=/home/pmcke/Alerts
+ExecStart=/home/pmcke/Alerts/venv/bin/python /home/pmcke/Alerts/gmail_message_responder.py
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
