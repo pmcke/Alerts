@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=pmcke
-WorkingDirectory=/home/pmcke/Alerts
-ExecStart=/home/pmcke/Alerts/venv/bin/python /home/pmcke/Alerts/gmail_message_responder.py
+User=<user_name>
+WorkingDirectory=/home/<user_name>/Alerts
+ExecStart=/home/<user_name>/Alerts/venv/bin/python /home/<user_name>/Alerts/gmail_message_responder.py
 Restart=on-failure
 RestartSec=30
 
