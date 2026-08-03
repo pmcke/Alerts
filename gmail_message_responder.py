@@ -389,37 +389,58 @@ def ensure_processed_folder(
     """
     Ensure that the destination folder exists.
 
-    Gmail labels appear as IMAP folders. CREATE will create the label when the
-    authenticated account permits it.
+    Gmail labels appear as IMAP folders. We list all folders and look for the
+    configured name. If it is absent, CREATE makes the Gmail label.
     """
-    status, _ = mailbox.list("", quote_mailbox_name(processed_folder))
+    status, folders = mailbox.list()
 
-    if status == "OK":
-        # LIST can return OK with no matches, so check explicitly below.
-        status_all, folders = mailbox.list()
+    if status == "OK" and folders:
+        wanted = processed_folder.casefold()
 
-        if status_all == "OK" and folders:
-            wanted = processed_folder.casefold()
+        for item in folders:
+            if not item:
+                continue
 
-            for item in folders:
-                if not item:
-                    continue
+            decoded = item.decode("utf-8", errors="replace").casefold()
 
-                decoded = item.decode("utf-8", errors="replace").casefold()
-
-                if wanted in decoded:
-                    return True
+            # Gmail's LIST response includes flags, delimiter and mailbox name.
+            # Matching the final mailbox name exactly is awkward because mailbox
+            # names may be quoted, so accept a quoted or unquoted ending.
+            if (
+                decoded.rstrip().endswith(f'"{wanted}"')
+                or decoded.rstrip().endswith(wanted)
+            ):
+                return True
 
     logger.info(
         "Processed folder %r was not found; attempting to create it",
         processed_folder,
     )
 
-    status, response = mailbox.create(quote_mailbox_name(processed_folder))
+    status, response = mailbox.create(processed_folder)
 
     if status == "OK":
         logger.info("Created IMAP folder %r", processed_folder)
         return True
+
+    # Some servers return NO if another process created the folder between
+    # LIST and CREATE. Re-list before treating that as a hard failure.
+    status, folders = mailbox.list()
+
+    if status == "OK" and folders:
+        wanted = processed_folder.casefold()
+
+        for item in folders:
+            if not item:
+                continue
+
+            decoded = item.decode("utf-8", errors="replace").casefold()
+
+            if (
+                decoded.rstrip().endswith(f'"{wanted}"')
+                or decoded.rstrip().endswith(wanted)
+            ):
+                return True
 
     logger.error(
         "Could not create IMAP folder %r: %r",
