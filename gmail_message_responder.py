@@ -2,19 +2,25 @@
 """
 gmail_message_responder.py
 
-Monitors a Gmail inbox using IMAP. When it finds an unread email from the
-configured sender with the configured subject, it extracts a recipient email
-address from the message body and sends a templated reply through Mailjet.
+Monitors a Gmail inbox using IMAP. When it finds a message from the configured
+sender with the configured subject, it extracts an email address from the body
+and sends a templated response through Mailjet.
 
-Designed to sit in the same folder as:
+After a successful Mailjet send, the incoming message is moved from INBOX to
+the configured IMAP folder, for example "Processed".
+
+Place this file in the same folder as:
+
     camera_monitor.py
     config.ini
     gmail_responder.ini
-    templates/
+    templates/gmail_thank_you.html
 
-The script deliberately does not import camera_monitor.py because importing it
-would also load its MQTT configuration and initialise its global state. Instead,
-it uses the same Mailjet v3.1 API and HTML-template approach.
+Mailjet credentials are read from the existing [mailjet] section of config.ini.
+Gmail settings and matching rules are read from gmail_responder.ini.
+
+This program is independent of camera_monitor.py. It does not use station
+records, the stations database, alert state, or unsubscribe links.
 """
 
 from __future__ import annotations
@@ -24,7 +30,6 @@ import email
 import html
 import imaplib
 import logging
-import os
 import re
 import signal
 import sys
@@ -37,32 +42,57 @@ from typing import Iterable
 from mailjet_rest import Client
 
 
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent
+
 RESPONDER_CONFIG_FILE = BASE_DIR / "gmail_responder.ini"
 CAMERA_CONFIG_FILE = BASE_DIR / "config.ini"
+
 TEMPLATE_DIR_PRIMARY = BASE_DIR / "templates"
 TEMPLATE_DIR_FALLBACK = Path("/etc/camera-monitor/templates")
+
+
+# ---------------------------------------------------------------------------
+# Logging and shutdown handling
+# ---------------------------------------------------------------------------
 
 logger = logging.getLogger("gmail_message_responder")
 running = True
 
 
 def stop_requested(signum, frame):
+    """Request a clean shutdown after the current mailbox check."""
     global running
     logger.info("Stop requested; exiting after the current check")
     running = False
 
 
-def load_ini(path: Path) -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser(interpolation=None)
-    if not cfg.read(path):
-        raise FileNotFoundError(f"Could not read configuration file: {path}")
-    return cfg
+# ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
 
+def load_ini(path: Path) -> configparser.ConfigParser:
+    """Load an INI file without ConfigParser interpolation."""
+    config = configparser.ConfigParser(interpolation=None)
+
+    if not config.read(path):
+        raise FileNotFoundError(f"Could not read configuration file: {path}")
+
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Email parsing helpers
+# ---------------------------------------------------------------------------
 
 def decode_mime_header(value: str | None) -> str:
+    """Decode an encoded email header such as Subject or From."""
     if not value:
         return ""
+
     try:
         return str(make_header(decode_header(value))).strip()
     except Exception:
@@ -70,21 +100,35 @@ def decode_mime_header(value: str | None) -> str:
 
 
 def normalise_subject(value: str) -> str:
-    """Collapse whitespace and compare subjects case-insensitively."""
+    """Collapse whitespace and make a subject suitable for comparison."""
     return " ".join((value or "").split()).casefold()
+
+
+def extract_sender_address(from_header: str) -> str:
+    """Extract the first email address from a From header."""
+    match = re.search(
+        r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+        from_header or "",
+        flags=re.IGNORECASE,
+    )
+
+    if not match:
+        return ""
+
+    return match.group(0).casefold()
 
 
 def extract_text_parts(message: Message) -> tuple[str, str]:
     """
-    Return (plain_text, html_text).
+    Return the plain-text and HTML portions of a message.
 
-    Attachments are ignored. Plain text is preferred when extracting the
-    recipient address.
+    Attachments are ignored.
     """
     plain_parts: list[str] = []
     html_parts: list[str] = []
 
     parts: Iterable[Message]
+
     if message.is_multipart():
         parts = message.walk()
     else:
@@ -95,20 +139,24 @@ def extract_text_parts(message: Message) -> tuple[str, str]:
             continue
 
         disposition = (part.get_content_disposition() or "").lower()
+
         if disposition == "attachment":
             continue
 
         content_type = part.get_content_type().lower()
+
         if content_type not in {"text/plain", "text/html"}:
             continue
 
         try:
             payload = part.get_payload(decode=True)
+
             if payload is None:
                 text = str(part.get_payload() or "")
             else:
                 charset = part.get_content_charset() or "utf-8"
                 text = payload.decode(charset, errors="replace")
+
         except Exception:
             logger.exception("Could not decode one message body part")
             continue
@@ -122,9 +170,14 @@ def extract_text_parts(message: Message) -> tuple[str, str]:
 
 
 def html_to_text(value: str) -> str:
-    """Simple HTML-to-text conversion sufficient for locating an email address."""
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value or "")
+    """Convert enough HTML to text to locate an email address."""
+    text = re.sub(
+        r"(?is)<(script|style).*?>.*?</\1>",
+        " ",
+        value or "",
+    )
     text = re.sub(r"(?s)<[^>]+>", " ", text)
+
     return html.unescape(text)
 
 
@@ -134,17 +187,24 @@ def extract_recipient_email(
     allowed_domains: list[str],
 ) -> str | None:
     """
-    Extract the destination email address.
+    Extract the destination email address from the incoming message body.
 
-    The regular expression may either:
-      * contain a named group called 'email', or
-      * contain a first capturing group, or
+    The configured regular expression may:
+
+      * contain a named group called "email";
+      * contain a first capturing group; or
       * match the address directly.
     """
     try:
-        match = re.search(extraction_regex, body_text, flags=re.IGNORECASE | re.MULTILINE)
+        match = re.search(
+            extraction_regex,
+            body_text,
+            flags=re.IGNORECASE | re.MULTILINE,
+        )
     except re.error as exc:
-        raise ValueError(f"Invalid recipient_regex in gmail_responder.ini: {exc}") from exc
+        raise ValueError(
+            f"Invalid recipient_regex in gmail_responder.ini: {exc}"
+        ) from exc
 
     if not match:
         return None
@@ -156,173 +216,606 @@ def extract_recipient_email(
     else:
         candidate = match.group(0)
 
-    candidate = (candidate or "").strip().strip("<>()[]{}'\".,;:")
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", candidate):
+    candidate = (candidate or "").strip().strip(
+        "<>()[]{}'\".,;:"
+    )
+
+    if not re.fullmatch(
+        r"[^@\s]+@[^@\s]+\.[^@\s]+",
+        candidate,
+    ):
         return None
 
     if allowed_domains:
         domain = candidate.rsplit("@", 1)[1].casefold()
+
         if domain not in allowed_domains:
-            logger.warning("Extracted address domain is not permitted: %s", domain)
+            logger.warning(
+                "Extracted address domain is not permitted: %s",
+                domain,
+            )
             return None
 
     return candidate
 
 
-def load_template(filename: str) -> str:
-    for directory in (TEMPLATE_DIR_PRIMARY, TEMPLATE_DIR_FALLBACK):
-        path = directory / filename
+# ---------------------------------------------------------------------------
+# Template and Mailjet helpers
+# ---------------------------------------------------------------------------
+
+def load_template(template_filename: str) -> str:
+    """Load an HTML email template."""
+    candidates = [
+        TEMPLATE_DIR_PRIMARY / template_filename,
+        TEMPLATE_DIR_FALLBACK / template_filename,
+    ]
+
+    for path in candidates:
         try:
             return path.read_text(encoding="utf-8")
+
         except FileNotFoundError:
             continue
+
         except Exception:
             logger.exception("Could not read template: %s", path)
             return ""
 
     logger.error(
         "Template %s was not found in %s or %s",
-        filename,
+        template_filename,
         TEMPLATE_DIR_PRIMARY,
         TEMPLATE_DIR_FALLBACK,
     )
+
     return ""
 
 
-def send_mailjet_email(
+def send_email(
     mailjet: Client,
     from_email: str,
     from_name: str,
-    recipient: str,
+    recipient_email: str,
     subject: str,
     template_filename: str,
-    template_vars: dict[str, str],
-    bcc_addresses: list[str],
+    template_vars: dict[str, str] | None = None,
+    bcc_addresses: list[str] | None = None,
 ) -> bool:
+    """
+    Send one generic HTML email through Mailjet.
+
+    This function has no knowledge of stations, databases, alerts, or
+    unsubscribe links.
+    """
     template = load_template(template_filename)
+
     if not template:
         return False
 
-    safe_vars = {
-        "recipient_email": html.escape(recipient),
-        **template_vars,
-    }
+    merged_vars = dict(template_vars or {})
+
+    merged_vars.setdefault(
+        "recipient_email",
+        html.escape(recipient_email),
+    )
 
     try:
-        body_html = template.format(**safe_vars)
+        body_html = template.format(**merged_vars)
+
+    except KeyError as exc:
+        logger.error(
+            "Template %s contains an unknown placeholder: %s",
+            template_filename,
+            exc,
+        )
+        return False
+
     except Exception:
-        logger.exception("Template formatting failed for %s", template_filename)
+        logger.exception(
+            "Template formatting failed for %s",
+            template_filename,
+        )
         return False
 
     message = {
-        "From": {"Email": from_email, "Name": from_name},
-        "To": [{"Email": recipient}],
+        "From": {
+            "Email": from_email,
+            "Name": from_name,
+        },
+        "To": [
+            {
+                "Email": recipient_email,
+            }
+        ],
         "Subject": subject,
         "HTMLPart": body_html,
     }
 
     if bcc_addresses:
-        message["Bcc"] = [{"Email": address} for address in bcc_addresses]
+        message["Bcc"] = [
+            {"Email": address}
+            for address in bcc_addresses
+        ]
+
+    data = {
+        "Messages": [
+            message,
+        ]
+    }
 
     try:
-        result = mailjet.send.create(data={"Messages": [message]})
-        if result.status_code >= 300:
-            logger.error("Mailjet error %s: %s", result.status_code, result.json())
-            return False
+        result = mailjet.send.create(data=data)
+
     except Exception:
         logger.exception("Mailjet send failed")
         return False
 
-    logger.info("Mailjet email sent to %s with subject %r", recipient, subject)
+    if result.status_code >= 300:
+        try:
+            response_body = result.json()
+        except Exception:
+            response_body = getattr(result, "text", "")
+
+        logger.error(
+            "Mailjet error %s: %s",
+            result.status_code,
+            response_body,
+        )
+        return False
+
+    logger.info(
+        "Mailjet email sent to %s with subject %r",
+        recipient_email,
+        subject,
+    )
+
     return True
 
 
-def mark_processed(
+# ---------------------------------------------------------------------------
+# IMAP folder handling
+# ---------------------------------------------------------------------------
+
+def quote_mailbox_name(name: str) -> str:
+    """Quote an IMAP mailbox name safely."""
+    escaped = (name or "").replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def ensure_processed_folder(
+    mailbox: imaplib.IMAP4_SSL,
+    processed_folder: str,
+) -> bool:
+    """
+    Ensure that the destination folder exists.
+
+    Gmail labels appear as IMAP folders. CREATE will create the label when the
+    authenticated account permits it.
+    """
+    status, _ = mailbox.list("", quote_mailbox_name(processed_folder))
+
+    if status == "OK":
+        # LIST can return OK with no matches, so check explicitly below.
+        status_all, folders = mailbox.list()
+
+        if status_all == "OK" and folders:
+            wanted = processed_folder.casefold()
+
+            for item in folders:
+                if not item:
+                    continue
+
+                decoded = item.decode("utf-8", errors="replace").casefold()
+
+                if wanted in decoded:
+                    return True
+
+    logger.info(
+        "Processed folder %r was not found; attempting to create it",
+        processed_folder,
+    )
+
+    status, response = mailbox.create(quote_mailbox_name(processed_folder))
+
+    if status == "OK":
+        logger.info("Created IMAP folder %r", processed_folder)
+        return True
+
+    logger.error(
+        "Could not create IMAP folder %r: %r",
+        processed_folder,
+        response,
+    )
+    return False
+
+
+def move_processed_message(
     mailbox: imaplib.IMAP4_SSL,
     message_id: bytes,
-    processed_keyword: str,
-    mark_as_read: bool,
+    processed_folder: str,
+) -> bool:
+    """
+    Move a successfully processed message out of the Inbox.
+
+    Prefer the IMAP MOVE command when supported. Otherwise use COPY followed by
+    marking the original as deleted and EXPUNGE.
+    """
+    destination = quote_mailbox_name(processed_folder)
+
+    capabilities = {
+        item.decode("ascii", errors="ignore").upper()
+        if isinstance(item, bytes)
+        else str(item).upper()
+        for item in getattr(mailbox, "capabilities", set())
+    }
+
+    if "MOVE" in capabilities:
+        try:
+            status, response = mailbox.uid(
+                "MOVE",
+                message_id,
+                destination,
+            )
+
+            if status == "OK":
+                logger.info(
+                    "Moved incoming message %r to %s",
+                    message_id,
+                    processed_folder,
+                )
+                return True
+
+            logger.warning(
+                "IMAP MOVE failed for message %r: %r; using fallback",
+                message_id,
+                response,
+            )
+
+        except Exception:
+            logger.exception(
+                "IMAP MOVE failed for message %r; using fallback",
+                message_id,
+            )
+
+    status, response = mailbox.uid(
+        "COPY",
+        message_id,
+        destination,
+    )
+
+    if status != "OK":
+        logger.error(
+            "Could not copy message %r to %s: %r",
+            message_id,
+            processed_folder,
+            response,
+        )
+        return False
+
+    status, response = mailbox.uid(
+        "STORE",
+        message_id,
+        "+FLAGS",
+        r"(\Deleted)",
+    )
+
+    if status != "OK":
+        logger.error(
+            "Message %r was copied to %s, but the Inbox copy could not "
+            "be marked deleted: %r",
+            message_id,
+            processed_folder,
+            response,
+        )
+        return False
+
+    status, response = mailbox.expunge()
+
+    if status != "OK":
+        logger.error(
+            "Message %r was copied and marked deleted, but EXPUNGE failed: %r",
+            message_id,
+            response,
+        )
+        return False
+
+    logger.info(
+        "Moved incoming message %r to %s using COPY/DELETE fallback",
+        message_id,
+        processed_folder,
+    )
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Gmail processing
+# ---------------------------------------------------------------------------
+
+def process_one_message(
+    mailbox: imaplib.IMAP4_SSL,
+    message_id: bytes,
+    required_sender: str,
+    required_subject: str,
+    exact_subject: bool,
+    recipient_regex: str,
+    allowed_domains: list[str],
+    mailjet: Client,
+    from_email: str,
+    from_name: str,
+    outgoing_subject: str,
+    template_filename: str,
+    bcc_addresses: list[str],
+    processed_folder: str,
 ) -> None:
-    flags = []
-    if mark_as_read:
-        flags.append(r"\Seen")
-    if processed_keyword:
-        flags.append(processed_keyword)
+    """Fetch, validate, respond to, and move one Gmail message."""
+    status, fetched = mailbox.uid(
+        "FETCH",
+        message_id,
+        "(RFC822)",
+    )
 
-    if flags:
-        mailbox.store(message_id, "+FLAGS", f"({' '.join(flags)})")
+    if status != "OK" or not fetched:
+        logger.warning(
+            "Could not fetch Gmail message %r",
+            message_id,
+        )
+        return
+
+    raw_message = None
+
+    for item in fetched:
+        if isinstance(item, tuple) and len(item) >= 2:
+            raw_message = item[1]
+            break
+
+    if not raw_message:
+        logger.warning(
+            "Gmail message %r contained no RFC822 body",
+            message_id,
+        )
+        return
+
+    message = email.message_from_bytes(raw_message)
+
+    sender_header = decode_mime_header(message.get("From"))
+    sender_address = extract_sender_address(sender_header)
+
+    actual_subject = decode_mime_header(message.get("Subject"))
+
+    if sender_address != required_sender:
+        return
+
+    if exact_subject:
+        subject_matches = (
+            normalise_subject(actual_subject)
+            == normalise_subject(required_subject)
+        )
+    else:
+        subject_matches = (
+            normalise_subject(required_subject)
+            in normalise_subject(actual_subject)
+        )
+
+    if not subject_matches:
+        return
+
+    plain_text, html_text = extract_text_parts(message)
+    body_text = plain_text.strip() or html_to_text(html_text)
+
+    recipient_email = extract_recipient_email(
+        body_text,
+        recipient_regex,
+        allowed_domains,
+    )
+
+    if not recipient_email:
+        logger.warning(
+            "Matching Gmail message %r contained no permitted recipient address",
+            decode_mime_header(message.get("Message-ID")),
+        )
+        return
+
+    template_vars = {
+        "original_sender": html.escape(sender_address),
+        "original_subject": html.escape(actual_subject),
+    }
+
+    sent = send_email(
+        mailjet=mailjet,
+        from_email=from_email,
+        from_name=from_name,
+        recipient_email=recipient_email,
+        subject=outgoing_subject,
+        template_filename=template_filename,
+        template_vars=template_vars,
+        bcc_addresses=bcc_addresses,
+    )
+
+    if not sent:
+        return
+
+    moved = move_processed_message(
+        mailbox=mailbox,
+        message_id=message_id,
+        processed_folder=processed_folder,
+    )
+
+    if not moved:
+        logger.warning(
+            "Mailjet response was sent, but incoming message %r remains in INBOX",
+            message_id,
+        )
 
 
-def process_mailbox() -> int:
-    responder_cfg = load_ini(RESPONDER_CONFIG_FILE)
-    camera_cfg = load_ini(CAMERA_CONFIG_FILE)
+# ---------------------------------------------------------------------------
+# Main monitoring loop
+# ---------------------------------------------------------------------------
 
-    gmail_user = responder_cfg.get("gmail", "username").strip()
-    gmail_password = responder_cfg.get("gmail", "password").strip()
-    imap_host = responder_cfg.get("gmail", "imap_host", fallback="imap.gmail.com").strip()
-    mailbox_name = responder_cfg.get("gmail", "mailbox", fallback="INBOX").strip()
+def monitor_gmail() -> int:
+    """Load configuration and continuously monitor Gmail."""
+    responder_config = load_ini(RESPONDER_CONFIG_FILE)
+    camera_config = load_ini(CAMERA_CONFIG_FILE)
 
-    required_sender = responder_cfg.get("filter", "from_address").strip().casefold()
-    required_subject = responder_cfg.get("filter", "subject").strip()
-    exact_subject = responder_cfg.getboolean("filter", "exact_subject", fallback=True)
-    only_unseen = responder_cfg.getboolean("filter", "only_unseen", fallback=True)
+    gmail_username = responder_config.get(
+        "gmail",
+        "username",
+        fallback="",
+    ).strip()
 
-    recipient_regex = responder_cfg.get(
+    gmail_password = responder_config.get(
+        "gmail",
+        "password",
+        fallback="",
+    ).strip()
+
+    imap_host = responder_config.get(
+        "gmail",
+        "imap_host",
+        fallback="imap.gmail.com",
+    ).strip()
+
+    mailbox_name = responder_config.get(
+        "gmail",
+        "mailbox",
+        fallback="INBOX",
+    ).strip()
+
+    required_sender = responder_config.get(
+        "filter",
+        "from_address",
+        fallback="",
+    ).strip().casefold()
+
+    required_subject = responder_config.get(
+        "filter",
+        "subject",
+        fallback="",
+    ).strip()
+
+    exact_subject = responder_config.getboolean(
+        "filter",
+        "exact_subject",
+        fallback=True,
+    )
+
+    only_unseen = responder_config.getboolean(
+        "filter",
+        "only_unseen",
+        fallback=True,
+    )
+
+    recipient_regex = responder_config.get(
         "extraction",
         "recipient_regex",
-        fallback=r"(?P<email>[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,})",
+        fallback=(
+            r"(?P<email>"
+            r"[A-Z0-9._%+-]+"
+            r"@[A-Z0-9.-]+"
+            r"\.[A-Z]{2,}"
+            r")"
+        ),
     )
+
     allowed_domains = [
         item.strip().casefold()
-        for item in responder_cfg.get("extraction", "allowed_domains", fallback="").split(",")
+        for item in responder_config.get(
+            "extraction",
+            "allowed_domains",
+            fallback="",
+        ).split(",")
         if item.strip()
     ]
 
-    outgoing_subject = responder_cfg.get(
+    outgoing_subject = responder_config.get(
         "response",
         "subject",
         fallback="Thank you for your message",
     ).strip()
-    template_filename = responder_cfg.get(
+
+    template_filename = responder_config.get(
         "response",
         "template",
         fallback="gmail_thank_you.html",
     ).strip()
-    poll_seconds = max(10, responder_cfg.getint("monitor", "poll_seconds", fallback=60))
-    processed_keyword = responder_cfg.get(
-        "monitor",
-        "processed_keyword",
-        fallback="GmailResponderProcessed",
-    ).strip()
-    mark_as_read = responder_cfg.getboolean("monitor", "mark_as_read", fallback=True)
 
-    mailjet_api_key = camera_cfg.get("mailjet", "api_key", fallback="").strip()
-    mailjet_secret = camera_cfg.get("mailjet", "api_secret", fallback="").strip()
-    from_email = camera_cfg.get("mailjet", "from_email", fallback="").strip()
-    from_name = camera_cfg.get("mailjet", "from_name", fallback="Camera Alerts").strip()
+    poll_seconds = max(
+        10,
+        responder_config.getint(
+            "monitor",
+            "poll_seconds",
+            fallback=60,
+        ),
+    )
+
+    processed_folder = responder_config.get(
+        "monitor",
+        "processed_folder",
+        fallback="Processed",
+    ).strip()
+
+    mailjet_api_key = camera_config.get(
+        "mailjet",
+        "api_key",
+        fallback="",
+    ).strip()
+
+    mailjet_secret = camera_config.get(
+        "mailjet",
+        "api_secret",
+        fallback="",
+    ).strip()
+
+    from_email = camera_config.get(
+        "mailjet",
+        "from_email",
+        fallback="",
+    ).strip()
+
+    from_name = camera_config.get(
+        "mailjet",
+        "from_name",
+        fallback="Camera Alerts",
+    ).strip()
+
     bcc_addresses = [
         item.strip()
-        for item in camera_cfg.get("mailjet", "bcc_emails", fallback="").split(",")
+        for item in camera_config.get(
+            "mailjet",
+            "bcc_emails",
+            fallback="",
+        ).split(",")
         if item.strip()
     ]
 
+    required_values = {
+        "gmail.username": gmail_username,
+        "gmail.password": gmail_password,
+        "filter.from_address": required_sender,
+        "filter.subject": required_subject,
+        "response.template": template_filename,
+        "monitor.processed_folder": processed_folder,
+        "mailjet.api_key": mailjet_api_key,
+        "mailjet.api_secret": mailjet_secret,
+        "mailjet.from_email": from_email,
+    }
+
     missing = [
         name
-        for name, value in (
-            ("gmail.username", gmail_user),
-            ("gmail.password", gmail_password),
-            ("filter.from_address", required_sender),
-            ("filter.subject", required_subject),
-            ("mailjet.api_key", mailjet_api_key),
-            ("mailjet.api_secret", mailjet_secret),
-            ("mailjet.from_email", from_email),
-        )
+        for name, value in required_values.items()
         if not value
     ]
-    if missing:
-        raise ValueError("Missing configuration value(s): " + ", ".join(missing))
 
-    mailjet = Client(auth=(mailjet_api_key, mailjet_secret), version="v3.1")
+    if missing:
+        raise ValueError(
+            "Missing configuration value(s): "
+            + ", ".join(missing)
+        )
+
+    mailjet = Client(
+        auth=(mailjet_api_key, mailjet_secret),
+        version="v3.1",
+    )
 
     logger.info(
         "Monitoring %s/%s for sender=%s subject=%r every %s seconds",
@@ -334,117 +827,88 @@ def process_mailbox() -> int:
     )
 
     while running:
-        mailbox = None
+        mailbox: imaplib.IMAP4_SSL | None = None
+
         try:
             mailbox = imaplib.IMAP4_SSL(imap_host)
-            mailbox.login(gmail_user, gmail_password)
-            status, _ = mailbox.select(mailbox_name)
+            mailbox.login(gmail_username, gmail_password)
+
+            status, response = mailbox.select(
+                quote_mailbox_name(mailbox_name)
+            )
+
             if status != "OK":
-                raise RuntimeError(f"Could not select mailbox {mailbox_name!r}")
+                raise RuntimeError(
+                    f"Could not select mailbox {mailbox_name!r}: "
+                    f"{response!r}"
+                )
 
-            criteria = ["UNSEEN"] if only_unseen else ["ALL"]
-            if processed_keyword:
-                criteria.extend(["UNKEYWORD", processed_keyword])
+            if not ensure_processed_folder(
+                mailbox,
+                processed_folder,
+            ):
+                raise RuntimeError(
+                    f"Processed folder {processed_folder!r} is unavailable"
+                )
 
-            status, data = mailbox.search(None, *criteria)
+            search_criteria = ["UNSEEN"] if only_unseen else ["ALL"]
+
+            status, search_data = mailbox.uid(
+                "SEARCH",
+                None,
+                *search_criteria,
+            )
+
             if status != "OK":
                 raise RuntimeError("Gmail IMAP search failed")
 
-            message_ids = data[0].split()
+            message_ids = search_data[0].split()
+
             if message_ids:
-                logger.info("Found %d candidate message(s)", len(message_ids))
+                logger.info(
+                    "Found %d candidate message(s)",
+                    len(message_ids),
+                )
 
             for message_id in message_ids:
-                status, fetched = mailbox.fetch(message_id, "(RFC822)")
-                if status != "OK" or not fetched or not fetched[0]:
-                    logger.warning("Could not fetch Gmail message %r", message_id)
-                    continue
+                if not running:
+                    break
 
-                raw_message = fetched[0][1]
-                message = email.message_from_bytes(raw_message)
-
-                sender_header = decode_mime_header(message.get("From"))
-                sender_address_match = re.search(
-                    r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-                    sender_header,
-                    flags=re.IGNORECASE,
-                )
-                sender_address = (
-                    sender_address_match.group(0).casefold()
-                    if sender_address_match
-                    else ""
-                )
-
-                actual_subject = decode_mime_header(message.get("Subject"))
-                if sender_address != required_sender:
-                    continue
-
-                if exact_subject:
-                    subject_matches = (
-                        normalise_subject(actual_subject)
-                        == normalise_subject(required_subject)
-                    )
-                else:
-                    subject_matches = (
-                        normalise_subject(required_subject)
-                        in normalise_subject(actual_subject)
-                    )
-
-                if not subject_matches:
-                    continue
-
-                plain_text, html_text = extract_text_parts(message)
-                body_text = plain_text.strip() or html_to_text(html_text)
-
-                recipient = extract_recipient_email(
-                    body_text,
-                    recipient_regex,
-                    allowed_domains,
-                )
-                if not recipient:
-                    logger.warning(
-                        "Matching Gmail message %r contained no permitted recipient address",
-                        decode_mime_header(message.get("Message-ID")),
-                    )
-                    continue
-
-                template_vars = {
-                    "original_sender": html.escape(sender_address),
-                    "original_subject": html.escape(actual_subject),
-                }
-
-                sent = send_mailjet_email(
+                process_one_message(
+                    mailbox=mailbox,
+                    message_id=message_id,
+                    required_sender=required_sender,
+                    required_subject=required_subject,
+                    exact_subject=exact_subject,
+                    recipient_regex=recipient_regex,
+                    allowed_domains=allowed_domains,
                     mailjet=mailjet,
                     from_email=from_email,
                     from_name=from_name,
-                    recipient=recipient,
-                    subject=outgoing_subject,
+                    outgoing_subject=outgoing_subject,
                     template_filename=template_filename,
-                    template_vars=template_vars,
                     bcc_addresses=bcc_addresses,
+                    processed_folder=processed_folder,
                 )
-
-                if sent:
-                    mark_processed(
-                        mailbox,
-                        message_id,
-                        processed_keyword,
-                        mark_as_read,
-                    )
 
             try:
                 mailbox.close()
             except Exception:
                 pass
+
             mailbox.logout()
+            mailbox = None
 
         except imaplib.IMAP4.error:
             logger.exception(
-                "Gmail IMAP login or mailbox error. For Gmail, use an app password "
-                "rather than the normal account password."
+                "Gmail IMAP login or mailbox error. "
+                "For Gmail, use an app password rather than "
+                "the normal account password."
             )
+
         except Exception:
             logger.exception("Error while checking Gmail")
+
         finally:
             if mailbox is not None:
                 try:
@@ -455,8 +919,10 @@ def process_mailbox() -> int:
         for _ in range(poll_seconds):
             if not running:
                 break
+
             time.sleep(1)
 
+    logger.info("Gmail responder stopped")
     return 0
 
 
@@ -470,9 +936,12 @@ def main() -> int:
     signal.signal(signal.SIGINT, stop_requested)
 
     try:
-        return process_mailbox()
+        return monitor_gmail()
+
     except Exception:
-        logger.exception("Fatal configuration or startup error")
+        logger.exception(
+            "Fatal configuration or startup error"
+        )
         return 1
 
 
