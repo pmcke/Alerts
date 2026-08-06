@@ -187,34 +187,75 @@ def extract_recipient_email(
     allowed_domains: list[str],
 ) -> str | None:
     """
-    Extract the destination email address from the incoming message body.
+    Extract the observer's email address from a fireball report.
 
-    The configured regular expression may:
+    Forwarding can alter line breaks or join the word "Local" directly to the
+    address. To avoid that, isolate the text between "Contact of the observer"
+    and "Local Date & Time", then extract an address only from that section.
 
-      * contain a named group called "email";
-      * contain a first capturing group; or
-      * match the address directly.
+    The configured extraction_regex remains available as a fallback.
     """
-    try:
-        match = re.search(
-            extraction_regex,
-            body_text,
-            flags=re.IGNORECASE | re.MULTILINE,
+    text = html.unescape(body_text or "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    section_match = re.search(
+        r"Contact\s+of\s+the\s+observer"
+        r"(?P<section>.*?)"
+        r"Local\s+Date\s*(?:&|and)?\s*Time",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+    candidate = ""
+
+    if section_match:
+        observer_section = section_match.group("section")
+
+        email_match = re.search(
+            r"-\s*(?P<email>"
+            r"[A-Z0-9._%+-]+"
+            r"@[A-Z0-9.-]+"
+            r"\.[A-Z]{2,24}"
+            r")",
+            observer_section,
+            flags=re.IGNORECASE,
         )
-    except re.error as exc:
-        raise ValueError(
-            f"Invalid recipient_regex in gmail_responder.ini: {exc}"
-        ) from exc
 
-    if not match:
-        return None
+        if not email_match:
+            email_match = re.search(
+                r"(?P<email>"
+                r"[A-Z0-9._%+-]+"
+                r"@[A-Z0-9.-]+"
+                r"\.[A-Z]{2,24}"
+                r")",
+                observer_section,
+                flags=re.IGNORECASE,
+            )
 
-    if "email" in match.groupdict():
-        candidate = match.group("email")
-    elif match.lastindex:
-        candidate = match.group(1)
-    else:
-        candidate = match.group(0)
+        if email_match:
+            candidate = email_match.group("email").strip()
+
+    if not candidate:
+        try:
+            match = re.search(
+                extraction_regex,
+                text,
+                flags=re.IGNORECASE | re.MULTILINE | re.DOTALL,
+            )
+        except re.error as exc:
+            raise ValueError(
+                f"Invalid recipient_regex in gmail_responder.ini: {exc}"
+            ) from exc
+
+        if not match:
+            return None
+
+        if "email" in match.groupdict():
+            candidate = match.group("email")
+        elif match.lastindex:
+            candidate = match.group(1)
+        else:
+            candidate = match.group(0)
 
     candidate = (candidate or "").strip().strip(
         "<>()[]{}'\".,;:"
@@ -236,6 +277,7 @@ def extract_recipient_email(
             )
             return None
 
+    logger.info("Extracted observer email address: %s", candidate)
     return candidate
 
 
