@@ -906,95 +906,224 @@ def monitor_gmail() -> int:
         poll_seconds,
     )
 
+    imap_max_attempts = 3
+    imap_retry_delays = (10, 20)
+    imap_timeout_seconds = 30
+
     while running:
         mailbox: imaplib.IMAP4_SSL | None = None
+        message_ids: list[bytes] | None = None
+        authentication_failed = False
 
-        try:
-            mailbox = imaplib.IMAP4_SSL(imap_host)
-            mailbox.login(gmail_username, gmail_password)
-
-            status, response = mailbox.select(
-                quote_mailbox_name(mailbox_name)
-            )
-
-            if status != "OK":
-                raise RuntimeError(
-                    f"Could not select mailbox {mailbox_name!r}: "
-                    f"{response!r}"
-                )
-
-            if not ensure_processed_folder(
-                mailbox,
-                processed_folder,
-            ):
-                raise RuntimeError(
-                    f"Processed folder {processed_folder!r} is unavailable"
-                )
-
-            search_criteria = ["UNSEEN"] if only_unseen else ["ALL"]
-
-            status, search_data = mailbox.uid(
-                "SEARCH",
-                None,
-                *search_criteria,
-            )
-
-            if status != "OK":
-                raise RuntimeError("Gmail IMAP search failed")
-
-            message_ids = search_data[0].split()
-
-            if message_ids:
-                logger.info(
-                    "Found %d candidate message(s)",
-                    len(message_ids),
-                )
-
-            for message_id in message_ids:
-                if not running:
-                    break
-
-                process_one_message(
-                    mailbox=mailbox,
-                    message_id=message_id,
-                    required_sender=required_sender,
-                    required_subject=required_subject,
-                    exact_subject=exact_subject,
-                    recipient_regex=recipient_regex,
-                    allowed_domains=allowed_domains,
-                    mailjet=mailjet,
-                    from_email=from_email,
-                    from_name=from_name,
-                    outgoing_subject=outgoing_subject,
-                    template_filename=template_filename,
-                    bcc_addresses=bcc_addresses,
-                    processed_folder=processed_folder,
-                )
+        # Retry only the safe connection/setup/search portion. Once message
+        # processing starts we do not immediately repeat the cycle, because an
+        # IMAP failure after Mailjet has sent a response but before the source
+        # message is moved could otherwise cause a duplicate response.
+        for attempt in range(1, imap_max_attempts + 1):
+            if not running:
+                break
 
             try:
-                mailbox.close()
+                mailbox = imaplib.IMAP4_SSL(
+                    imap_host,
+                    port=993,
+                    timeout=imap_timeout_seconds,
+                )
+
+                try:
+                    mailbox.login(gmail_username, gmail_password)
+                except imaplib.IMAP4.error as exc:
+                    authentication_failed = True
+                    logger.error(
+                        "Gmail IMAP authentication failed: %s. "
+                        "For Gmail, check the username and app password.",
+                        exc,
+                    )
+                    break
+
+                status, response = mailbox.select(
+                    quote_mailbox_name(mailbox_name)
+                )
+
+                if status != "OK":
+                    raise RuntimeError(
+                        f"Could not select mailbox {mailbox_name!r}: "
+                        f"{response!r}"
+                    )
+
+                if not ensure_processed_folder(
+                    mailbox,
+                    processed_folder,
+                ):
+                    raise RuntimeError(
+                        f"Processed folder {processed_folder!r} is unavailable"
+                    )
+
+                search_criteria = ["UNSEEN"] if only_unseen else ["ALL"]
+
+                status, search_data = mailbox.uid(
+                    "SEARCH",
+                    None,
+                    *search_criteria,
+                )
+
+                if status != "OK":
+                    raise RuntimeError("Gmail IMAP search failed")
+
+                message_ids = search_data[0].split()
+
+                if attempt > 1:
+                    logger.info(
+                        "Gmail IMAP connection established on attempt %d/%d",
+                        attempt,
+                        imap_max_attempts,
+                    )
+
+                break
+
+            except (imaplib.IMAP4.abort, OSError, TimeoutError) as exc:
+                if mailbox is not None:
+                    try:
+                        mailbox.logout()
+                    except Exception:
+                        pass
+                    mailbox = None
+
+                if attempt >= imap_max_attempts:
+                    logger.error(
+                        "Gmail IMAP connection/setup failed after %d attempts: %s",
+                        imap_max_attempts,
+                        exc,
+                    )
+                    break
+
+                delay = imap_retry_delays[attempt - 1]
+                logger.warning(
+                    "Gmail IMAP connection/setup attempt %d/%d failed: %s; "
+                    "retrying in %d seconds",
+                    attempt,
+                    imap_max_attempts,
+                    exc,
+                    delay,
+                )
+
+                for _ in range(delay):
+                    if not running:
+                        break
+                    time.sleep(1)
+
+            except imaplib.IMAP4.error as exc:
+                if mailbox is not None:
+                    try:
+                        mailbox.logout()
+                    except Exception:
+                        pass
+                    mailbox = None
+
+                if attempt >= imap_max_attempts:
+                    logger.error(
+                        "Gmail IMAP mailbox/setup error after %d attempts: %s",
+                        imap_max_attempts,
+                        exc,
+                    )
+                    break
+
+                delay = imap_retry_delays[attempt - 1]
+                logger.warning(
+                    "Gmail IMAP mailbox/setup attempt %d/%d failed: %s; "
+                    "retrying in %d seconds",
+                    attempt,
+                    imap_max_attempts,
+                    exc,
+                    delay,
+                )
+
+                for _ in range(delay):
+                    if not running:
+                        break
+                    time.sleep(1)
+
             except Exception:
-                pass
+                logger.exception("Error while setting up Gmail IMAP connection")
+                if mailbox is not None:
+                    try:
+                        mailbox.logout()
+                    except Exception:
+                        pass
+                    mailbox = None
+                break
 
-            mailbox.logout()
-            mailbox = None
+        if mailbox is not None and message_ids is not None and running:
+            try:
+                if message_ids:
+                    logger.info(
+                        "Found %d candidate message(s)",
+                        len(message_ids),
+                    )
 
-        except imaplib.IMAP4.error:
-            logger.exception(
-                "Gmail IMAP login or mailbox error. "
-                "For Gmail, use an app password rather than "
-                "the normal account password."
-            )
+                for message_id in message_ids:
+                    if not running:
+                        break
 
-        except Exception:
-            logger.exception("Error while checking Gmail")
+                    process_one_message(
+                        mailbox=mailbox,
+                        message_id=message_id,
+                        required_sender=required_sender,
+                        required_subject=required_subject,
+                        exact_subject=exact_subject,
+                        recipient_regex=recipient_regex,
+                        allowed_domains=allowed_domains,
+                        mailjet=mailjet,
+                        from_email=from_email,
+                        from_name=from_name,
+                        outgoing_subject=outgoing_subject,
+                        template_filename=template_filename,
+                        bcc_addresses=bcc_addresses,
+                        processed_folder=processed_folder,
+                    )
 
-        finally:
-            if mailbox is not None:
+            except imaplib.IMAP4.abort as exc:
+                logger.error(
+                    "Gmail IMAP connection dropped while processing messages: %s. "
+                    "Processing will resume on the next polling cycle.",
+                    exc,
+                )
+
+            except imaplib.IMAP4.error as exc:
+                logger.error(
+                    "Gmail IMAP mailbox error while processing messages: %s",
+                    exc,
+                )
+
+            except Exception:
+                logger.exception("Error while checking Gmail")
+
+            finally:
+                try:
+                    mailbox.close()
+                except Exception:
+                    pass
+
                 try:
                     mailbox.logout()
                 except Exception:
                     pass
+
+                mailbox = None
+
+        elif mailbox is not None:
+            try:
+                mailbox.logout()
+            except Exception:
+                pass
+            mailbox = None
+
+        # A bad password will not be fixed by rapid retries. After logging the
+        # authentication error, return to the normal polling interval.
+        if authentication_failed:
+            logger.info(
+                "Will retry Gmail authentication at the next normal polling cycle"
+            )
 
         for _ in range(poll_seconds):
             if not running:
